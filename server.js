@@ -9,20 +9,28 @@ const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } });
 app.use(cors());
 app.use(express.json());
 
-const SYSTEM_PROMPT = `You are SelfHaircut.ai, an expert AI barber assistant. When given a side profile photo of a person's head, analyze it and return ONLY a JSON object with no extra text or markdown.
+const SYSTEM_PROMPT = `You are SelfHaircut.ai, an expert AI barber assistant specializing in self-haircuts. 
 
-JSON structure:
+When given a side profile photo, your PRIMARY task is to:
+1. Locate the sideburn — the strip of hair growing in front of the ear, between the ear and the face
+2. Find the BOTTOM EDGE of the sideburn (where it ends and bare skin begins)
+3. Place the taper/fade guide line just below that sideburn bottom edge
+
+This sideburn-anchored approach gives the most natural, accurate low taper line for the person's specific face.
+
+Return ONLY a valid JSON object with no extra text or markdown:
 {
-  "tapperLineY": <0.3-0.7, vertical position of bald line as fraction of image height>,
-  "tapperLineStartX": <0.0-0.5, where line starts horizontally>,
-  "tapperLineEndX": <0.5-1.0, where line ends horizontally>,
-  "fadeZoneHeight": <0.05-0.2, height of fade zone as fraction of image height>,
-  "taperType": <"low", "mid", or "high">,
-  "advice": <2-3 sentence plain text tip for this specific cut>,
+  "tapperLineY": <0.3-0.75, Y position of guide line as fraction of image height. Anchor this to just below the sideburn bottom edge>,
+  "tapperLineStartX": <0.05-0.45, where line starts — from the temple/sideburn front>,
+  "tapperLineEndX": <0.5-0.95, where line ends — past the ear>,
+  "fadeZoneHeight": <0.08-0.18, height of the fade blend zone above the line>,
+  "taperType": <"low", "mid", or "high" — based on where sideburn sits>,
+  "sideburnBottomY": <0.3-0.75, exact Y fraction where sideburn ends>,
+  "advice": <2-3 sentences of specific advice referencing their sideburn position and recommended guard numbers>,
   "confidence": <"high", "medium", or "low">
 }
 
-Analyze the ear position, temple, and natural hairline. If photo is unclear, set confidence to "low" and use defaults (tapperLineY:0.5, startX:0.2, endX:0.8, fadeZoneHeight:0.1).`;
+If no sideburn is clearly visible, estimate based on ear position and note it in advice.`;
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
@@ -52,7 +60,7 @@ app.post('/analyze', upload.single('photo'), async (req, res) => {
           role: 'user',
           content: [
             { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
-            { type: 'text', text: 'Analyze this side profile and return only the JSON.' }
+            { type: 'text', text: 'Locate the sideburn in this photo and place the low taper guide line just below it. Return only the JSON.' }
           ]
         }]
       })
