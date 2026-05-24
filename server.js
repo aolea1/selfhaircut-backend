@@ -1,9 +1,10 @@
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
+const fetch = require('node-fetch');
 
 const app = express();
-const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB max
+const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } });
 
 app.use(cors());
 app.use(express.json());
