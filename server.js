@@ -1,15 +1,19 @@
 const express = require('express');
-const cors = require('cors');
-const multer = require('multer');
-const fetch = require('node-fetch');
+const cors    = require('cors');
+const multer  = require('multer');
+const fetch   = require('node-fetch');
+const OpenAI  = require('openai');
+const { toFile } = require('openai');
 
-const app = express();
+const app    = express();
 const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } });
 
 app.use(cors());
 app.use(express.json());
 
-const SYSTEM_PROMPT = `You are SelfHaircut.ai, an expert AI barber assistant specializing in self-haircuts. 
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+const SYSTEM_PROMPT = `You are SelfHaircut.ai, an expert AI barber assistant specializing in self-haircuts.
 
 When given a side profile photo, your PRIMARY task is to:
 1. Locate the sideburn — the strip of hair growing in front of the ear, between the ear and the face
@@ -32,6 +36,15 @@ Return ONLY a valid JSON object with no extra text or markdown:
 
 If no sideburn is clearly visible, estimate based on ear position and note it in advice.`;
 
+const PREVIEW_PROMPT =
+  'Give this person a clean low taper fade and a natural sharp lineup. ' +
+  'Keep absolutely everything else exactly the same: face, skin tone, expression, head shape, ' +
+  'ear position, pose, lighting, background, clothing, beard, and any jewelry. ' +
+  'Only the hair changes. The taper should be realistic and achievable — ' +
+  'hair fades naturally to skin at the ear and neckline and blends upward to ' +
+  'the natural length on top. Not overly perfect or celebrity-barber level, ' +
+  'just a clean everyday barbershop result.';
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
@@ -42,7 +55,7 @@ app.post('/analyze', upload.single('photo'), async (req, res) => {
       return res.status(400).json({ error: 'No photo uploaded' });
     }
 
-    const base64 = req.file.buffer.toString('base64');
+    const base64    = req.file.buffer.toString('base64');
     const mediaType = req.file.mimetype || 'image/jpeg';
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -72,14 +85,69 @@ app.post('/analyze', upload.single('photo'), async (req, res) => {
       return res.status(500).json({ error: data.error.message });
     }
 
-    const raw = data.content.map(c => c.text || '').join('');
+    const raw    = data.content.map(c => c.text || '').join('');
     const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
 
     res.json(parsed);
 
   } catch (err) {
-    console.error(err);
+    console.error('[/analyze error]', err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── TAPER PREVIEW GENERATION ──
+app.post('/generate-preview', upload.single('photo'), async (req, res) => {
+  console.log('[/generate-preview] Request received');
+
+  try {
+    if (!req.file) {
+      console.error('[/generate-preview] No photo in request');
+      return res.status(400).json({ error: 'No photo uploaded' });
+    }
+
+    console.log('[/generate-preview] Cropped image received —', req.file.originalname || 'crop.jpg',
+      `${(req.file.size / 1024).toFixed(1)} KB`, req.file.mimetype);
+
+    if (!process.env.OPENAI_API_KEY) {
+      console.error('[/generate-preview] OPENAI_API_KEY is not set');
+      return res.status(500).json({ error: 'OPENAI_API_KEY not configured' });
+    }
+
+    console.log('[/generate-preview] Sending image to OpenAI image edit API (gpt-image-1)');
+
+    const imageFile = await toFile(
+      req.file.buffer,
+      req.file.originalname || 'photo.jpg',
+      { type: req.file.mimetype || 'image/jpeg' }
+    );
+
+    const result = await openai.images.edit({
+      model:  'gpt-image-1',
+      image:  imageFile,
+      prompt: PREVIEW_PROMPT,
+      n:      1,
+      size:   '1024x1024',
+    });
+
+    console.log('[/generate-preview] AI preview response received from OpenAI');
+
+    const b64 = result.data[0]?.b64_json;
+    if (!b64) {
+      console.error('[/generate-preview] OpenAI returned no image data:', JSON.stringify(result).slice(0, 300));
+      return res.status(500).json({ error: 'No image data in OpenAI response' });
+    }
+
+    const previewUrl = `data:image/png;base64,${b64}`;
+    console.log('[/generate-preview] Preview image returned to frontend —',
+      `${(b64.length / 1024).toFixed(0)} KB base64`);
+
+    res.json({ previewUrl });
+
+  } catch (err) {
+    console.error('[/generate-preview] Generation failed:', err.status || '', err.message);
+    if (err.error) console.error('[/generate-preview] OpenAI error detail:', JSON.stringify(err.error));
+    res.status(500).json({ error: err.message, detail: err.error || null });
   }
 });
 
