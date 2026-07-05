@@ -380,12 +380,26 @@ app.post('/use-credit', requireAuth, async (req, res) => {
       userData   = snap ? fromFsFields(snap.fields || {}) : {};
     }
 
+    // 1. Active promo → allow through
     const pa = userData.promoAccess;
     if (pa && pa.expiresAt > Date.now()) {
       return res.json({ credits: userData.credits ?? 0, promoActive: true, promoAccess: pa });
     }
     if (promoOnly) return res.json({ credits: userData.credits ?? 0, promoExpired: true });
 
+    // 2. Free guide — only if freeGuideUsed is explicitly false
+    //    Undefined means existing user before this field existed → treat as used.
+    if (userData.freeGuideUsed === false) {
+      if (adminDb) {
+        await adminDb.collection('users').doc(uid).update({ freeGuideUsed: true });
+      } else {
+        await fsPatch('users', uid, { freeGuideUsed: { booleanValue: true } }, token);
+      }
+      console.log(`[/use-credit] uid=${uid} used free guide`);
+      return res.json({ credits: userData.credits ?? 0, usedFreeGuide: true });
+    }
+
+    // 3. Credits
     const current = userData.credits ?? 0;
     if (current <= 0) return res.status(402).json({ error: 'no_credits', credits: 0 });
 
