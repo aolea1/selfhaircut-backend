@@ -422,10 +422,7 @@ Answer any question the user asks. For haircut questions, give clear, specific, 
 
 Keep responses concise — 2–4 sentences for simple questions, up to a short paragraph for complex ones. Use plain text, no markdown. Be warm, confident, and direct.
 
-IMPORTANT: Respond with valid JSON only, in this exact format:
-{"reply": "your response text here", "options": ["Option 1", "Option 2"]}
-
-The "options" array is for quick-reply buttons shown under your message. Include 2–4 short options (under 5 words each) when it would help the user pick a next step — for example after asking about style, tools, or what to do next. Set "options" to null if no follow-up choices are needed.`;
+`;
 
 app.post('/chat', async (req, res) => {
   const { message, history = [] } = req.body || {};
