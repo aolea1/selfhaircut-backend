@@ -467,6 +467,132 @@ app.get('/free-guide-status', requireAuth, async (req, res) => {
   }
 });
 
+// ── DEDUCT CREDIT (add-on purchases) ─────────────────────────────────────────
+// Generic single-credit deduction for optional packages (e.g. Fade Finish).
+// Does NOT interact with free-guide session logic.
+app.post('/deduct-credit', requireAuth, async (req, res) => {
+  const uid   = req.uid;
+  const token = req.idToken;
+  try {
+    let userData = {};
+    if (adminDb) {
+      const snap = await adminDb.collection('users').doc(uid).get();
+      userData   = snap.exists ? snap.data() : {};
+    } else {
+      const snap = await fsGet('users', uid, token);
+      userData   = snap ? fromFsFields(snap.fields || {}) : {};
+    }
+
+    const current = userData.credits ?? 0;
+    if (current <= 0) return res.status(402).json({ error: 'no_credits', credits: 0 });
+
+    if (adminDb) {
+      await adminDb.collection('users').doc(uid).update({
+        credits: admin.firestore.FieldValue.increment(-1),
+      });
+    } else {
+      await fsPatch('users', uid, { credits: { integerValue: String(current - 1) } }, token);
+    }
+
+    console.log(`[/deduct-credit] uid=${uid} remaining=${current - 1}`);
+    res.json({ credits: current - 1 });
+  } catch(err) {
+    console.error('[/deduct-credit]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── FADE FINISH PACKAGE ───────────────────────────────────────────────────────
+const FADE_FINISH_PROMPT = `You are a professional barber reviewing a client's finished self-haircut. Your role is to coach, not to reject. Be specific, honest, and encouraging.
+
+CRITICAL RULE: Always return the JSON below — even for imperfect, angled, or close-up photos. Only set "unusable": true if the image is completely black, shows no head or hair at all, is completely unrecognizable, or is clearly not a haircut photo. Everything else must be analyzed.
+
+Assess "confidence" based on photo quality:
+- "high": clear view of fade area, good lighting
+- "medium": slightly angled, close-up, or moderate lighting — still very usable
+- "low": significantly obscured or dim — analyze anyway and note the limitation
+
+For areas you cannot see (front hairline, beard, etc.) — do not guess. Use null for the score and say "Not visible in this photo."
+
+Return ONLY valid JSON, no markdown, no extra text:
+
+{
+  "unusable": false,
+  "unusableReason": null,
+  "confidence": "high",
+  "overallScore": 0-100,
+  "guidelinePlacement": {
+    "score": 0-100,
+    "assessment": "Where the taper/fade sits — natural, flattering height? 1-2 sentences."
+  },
+  "blendQuality": {
+    "score": 0-100,
+    "assessment": "How smooth is the gradient from skin to longer hair? 1-2 sentences."
+  },
+  "sideburnShape": {
+    "score": 0-100,
+    "assessment": "Sideburn shape, symmetry, cleanliness. 1 sentence."
+  },
+  "fadeConsistency": {
+    "score": 0-100,
+    "assessment": "Uneven patches, blotchy areas, skipped spots. 1-2 sentences."
+  },
+  "cleanupQuality": {
+    "score": 0-100,
+    "assessment": "Edge clarity around ear and neck. 1 sentence."
+  },
+  "whatYouDidWell": [
+    "Specific positive observation",
+    "Specific positive observation",
+    "Specific positive observation"
+  ],
+  "biggestImprovement": "The single most impactful thing to improve next time. Be concrete.",
+  "barberRecommendation": "One actionable tip for their next cut. 1-2 sentences.",
+  "motivationalNote": "Encouraging closing note. 1-2 sentences.",
+  "lineup": {
+    "frontHairline": {
+      "visible": true,
+      "assessment": "Is the front hairline clean and even? If not visible, say 'Not visible in this photo.' 1-2 sentences.",
+      "tip": "Specific tip for front lineup, or null if not visible."
+    },
+    "temples": {
+      "visible": true,
+      "assessment": "Temple shape — pointed, rounded, natural fade-out? Clean? 1-2 sentences.",
+      "tip": "Specific tip for temple cleanup, or null if not visible."
+    },
+    "sideburnCleanup": {
+      "visible": true,
+      "assessment": "Sideburn endpoint — is it clean, defined, symmetrical? 1-2 sentences.",
+      "tip": "Specific tip for sideburn cleanup, or null if not visible."
+    },
+    "beardConnection": {
+      "visible": false,
+      "assessment": "If beard is visible, assess the connection between fade and beard. If no beard visible, say 'Beard not visible in this photo.'",
+      "tip": null
+    }
+  }
+}
+
+Never return plain text. Never refuse. Always return the JSON.`;
+
+app.post('/fade-finish', upload.single('photo'), requireAuth, async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No photo uploaded' });
+    if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'AI not configured' });
+    const base64    = req.file.buffer.toString('base64');
+    const mediaType = req.file.mimetype || 'image/jpeg';
+    const result    = await callClaudeVision(base64, mediaType, FADE_FINISH_PROMPT,
+      'Analyze this finished haircut photo and return the full JSON including lineup guidance. Coach, do not reject.');
+    if (result.unusable === true) {
+      return res.status(422).json({ error: 'unusable_photo', reason: result.unusableReason || 'Photo not usable' });
+    }
+    res.json(result);
+  } catch(err) {
+    console.error('[/fade-finish]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── SEND EMAIL ────────────────────────────────────────────────────────────────
 app.post('/send-email', async (req, res) => {
   const { to, subject } = req.body || {};
