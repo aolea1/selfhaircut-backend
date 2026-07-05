@@ -460,5 +460,138 @@ app.post('/chat', async (req, res) => {
   }
 });
 
+// ── BARBER REPORT ─────────────────────────────────────────────────────────────
+const BARBER_REPORT_PROMPT = `You are an expert barber analyzing a side-profile photo of someone's hair before a self-haircut. Your job is to provide accurate, honest observations based only on what you can actually see in the photo.
+
+Return ONLY valid JSON — no markdown, no extra text. If you cannot confidently assess something from the photo, say so in the explanation field. Never invent or exaggerate observations.
+
+{
+  "density": {
+    "level": "Very Thin|Thin|Medium|Thick|Very Thick",
+    "explanation": "What this means for their fade. 1-2 sentences."
+  },
+  "hairLoss": {
+    "level": "No visible thinning|Mild temple recession|Crown thinning|Diffuse thinning|Advanced hair loss",
+    "detected": true or false,
+    "explanation": "Only mention thinning if genuinely visible. If none detected, say so briefly."
+  },
+  "texture": {
+    "type": "Straight|Wavy|Curly|Coily",
+    "explanation": "How this texture affects fading. 1-2 sentences."
+  },
+  "sideburnThickness": {
+    "level": "Sparse|Medium|Thick",
+    "explanation": "How this affects taper placement. 1 sentence."
+  },
+  "headShape": {
+    "shape": "Oval|Round|Square|Oblong|Diamond|Uncertain from this angle",
+    "confidence": "high|moderate|low",
+    "explanation": "Best estimate from side profile. Be honest if hard to tell."
+  },
+  "growthDirection": {
+    "direction": "Mostly downward|Mostly outward|Mixed",
+    "explanation": "How this impacts blending. 1 sentence."
+  },
+  "taperDifficulty": {
+    "level": "Easy|Moderate|Advanced",
+    "explanation": "Why. Based on hair type, density, texture. 1-2 sentences."
+  },
+  "barberNotes": [
+    "Personalized observation 1 based on actual photo",
+    "Personalized observation 2",
+    "Personalized observation 3"
+  ]
+}`;
+
+const GRADE_FADE_PROMPT = `You are an expert barber grading a finished self-haircut. Analyze the photo honestly and accurately. Only comment on what you can genuinely see.
+
+Return ONLY valid JSON — no markdown, no extra text:
+
+{
+  "guidelinePlacement": {
+    "score": 0-100,
+    "assessment": "Was the taper placed in the right position? 1-2 sentences."
+  },
+  "blendQuality": {
+    "score": 0-100,
+    "assessment": "How smooth is the transition? 1-2 sentences."
+  },
+  "sideburnShape": {
+    "score": 0-100,
+    "assessment": "Is the shape clean and balanced? 1 sentence."
+  },
+  "fadeConsistency": {
+    "score": 0-100,
+    "assessment": "Are there uneven spots? 1-2 sentences."
+  },
+  "cleanupQuality": {
+    "score": 0-100,
+    "assessment": "Are edges and details clean? 1 sentence."
+  },
+  "overallScore": 0-100,
+  "whatYouDidWell": [
+    "Specific positive observation 1",
+    "Specific positive observation 2",
+    "Specific positive observation 3"
+  ],
+  "biggestImprovement": "The single most impactful thing they can improve next time. Be specific.",
+  "barberRecommendation": "Specific actionable advice for their next haircut. 1-2 sentences.",
+  "motivationalNote": "Encouraging closing note. Acknowledge effort, point toward progress. 1-2 sentences."
+}`;
+
+async function callClaudeVision(base64, mediaType, systemPrompt, userText) {
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1200,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: [
+        { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
+        { type: 'text', text: userText },
+      ]}],
+    }),
+  });
+  const data = await response.json();
+  if (data.error) throw new Error(data.error.message);
+  const raw = data.content.map(c => c.text || '').join('');
+  return JSON.parse(raw.replace(/```json|```/g, '').trim());
+}
+
+app.post('/barber-report', upload.single('photo'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No photo uploaded' });
+    if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'AI not configured' });
+    const base64 = req.file.buffer.toString('base64');
+    const mediaType = req.file.mimetype || 'image/jpeg';
+    const result = await callClaudeVision(base64, mediaType, BARBER_REPORT_PROMPT,
+      'Analyze this side-profile photo and return the barber report JSON. Be accurate and honest.');
+    res.json(result);
+  } catch(err) {
+    console.error('[/barber-report]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/grade-fade', upload.single('photo'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No photo uploaded' });
+    if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'AI not configured' });
+    const base64 = req.file.buffer.toString('base64');
+    const mediaType = req.file.mimetype || 'image/jpeg';
+    const result = await callClaudeVision(base64, mediaType, GRADE_FADE_PROMPT,
+      'Grade this finished haircut honestly. Return the analysis JSON.');
+    res.json(result);
+  } catch(err) {
+    console.error('[/grade-fade]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`SelfHaircut.ai backend running on port ${PORT}`));
