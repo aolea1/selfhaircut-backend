@@ -439,7 +439,7 @@ app.post('/use-credit', requireAuth, async (req, res) => {
 });
 
 // ── FREE GUIDE STATUS ─────────────────────────────────────────────────────────
-app.get('/free-guide-status', verifyToken, async (req, res) => {
+app.get('/free-guide-status', requireAuth, async (req, res) => {
   const uid   = req.uid;
   const token = req.idToken;
   try {
