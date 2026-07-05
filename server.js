@@ -350,5 +350,48 @@ app.post('/send-email', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ── CHAT ──────────────────────────────────────────────────────────────────────
+const CHAT_SYSTEM = `You are SelfHaircut.ai, an expert AI barber assistant. You help people cut their own hair at home — primarily tapers, fades, buzz cuts, and lineups.
+
+Answer any question the user asks. For haircut questions, give clear, specific, actionable advice. For off-topic questions, answer helpfully and naturally, then gently bring the conversation back to haircuts if relevant.
+
+Keep responses concise — 2–4 sentences for simple questions, up to a short paragraph for complex ones. Use plain text, no markdown. Be warm, confident, and direct.`;
+
+app.post('/chat', async (req, res) => {
+  const { message, history = [] } = req.body || {};
+  if (!message) return res.status(400).json({ error: 'No message provided' });
+  if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'AI not configured' });
+
+  try {
+    const messages = [
+      ...history.slice(-6).map(m => ({ role: m.role, content: m.content })),
+      { role: 'user', content: message },
+    ];
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 512,
+        system: CHAT_SYSTEM,
+        messages,
+      }),
+    });
+
+    const data = await response.json();
+    if (data.error) return res.status(500).json({ error: data.error.message });
+    const reply = data.content?.map(c => c.text || '').join('').trim();
+    res.json({ reply });
+  } catch (err) {
+    console.error('[/chat]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`SelfHaircut.ai backend running on port ${PORT}`));
