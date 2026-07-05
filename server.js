@@ -352,7 +352,7 @@ app.post('/redeem-code', requireAuth, async (req, res) => {
     if (adminDb) {
       await adminDb.collection('users').doc(uid).set({ promoAccess }, { merge: true });
     } else {
-      await fsPatch('users', uid, { promoAccess: toFsFields(promoAccess).promoAccess }, token);
+      await fsPatch('users', uid, toFsFields({ promoAccess }), token);
     }
 
     console.log(`[/redeem-code] ✓ uid=${uid} code=${code} expires=${new Date(expiresAt).toISOString()}`);
