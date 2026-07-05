@@ -7,6 +7,67 @@ const app    = express();
 const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } });
 
 app.use(cors());
+
+// ── STRIPE WEBHOOK ────────────────────────────────────────────────────────────
+// Must be registered BEFORE express.json() — Stripe needs the raw body for
+// signature verification; express.json() would consume it first.
+app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig     = req.headers['stripe-signature'];
+  const secret  = process.env.STRIPE_WEBHOOK_SECRET;
+  const stripeKey = process.env.STRIPE_SECRET_KEY;
+
+  if (!secret || !stripeKey) {
+    console.error('[Webhook] STRIPE_WEBHOOK_SECRET or STRIPE_SECRET_KEY not set');
+    return res.status(500).json({ error: 'Webhook not configured' });
+  }
+
+  let event;
+  try {
+    const Stripe = require('stripe');
+    const stripe = Stripe(stripeKey);
+    event = stripe.webhooks.constructEvent(req.body, sig, secret);
+  } catch (err) {
+    console.error('[Webhook] Signature verification failed:', err.message);
+    return res.status(400).json({ error: 'Invalid signature' });
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session     = event.data.object;
+    const uid         = session.client_reference_id;
+    const amountCents = session.amount_total;
+
+    // Map purchase amount → credits (matches frontend pricing)
+    const CREDIT_MAP = { 999: 5, 2499: 15, 6999: 50 };
+    const credits = CREDIT_MAP[amountCents] ?? parseInt(session.metadata?.credits ?? '0');
+
+    console.log(`[Webhook] checkout.session.completed uid=${uid} amount=${amountCents} credits=${credits}`);
+
+    if (!uid || credits <= 0) {
+      console.error('[Webhook] Cannot credit — missing uid or unrecognised amount:', { uid, amountCents });
+      return res.json({ received: true }); // 200 so Stripe doesn't retry
+    }
+
+    try {
+      if (adminDb) {
+        await adminDb.collection('users').doc(uid).set(
+          { credits: admin.firestore.FieldValue.increment(credits) },
+          { merge: true }
+        );
+        console.log(`[Webhook] ✓ Added ${credits} credits to uid=${uid}`);
+      } else {
+        // Fallback: REST API with a server token isn't possible without service account.
+        // Log clearly so the operator knows what to do.
+        console.error('[Webhook] ✗ Firebase Admin SDK not available. Set FIREBASE_SERVICE_ACCOUNT to enable automatic credit delivery.');
+      }
+    } catch (err) {
+      console.error('[Webhook] Failed to write credits:', err.message);
+      return res.status(500).json({ error: 'Credit update failed' });
+    }
+  }
+
+  res.json({ received: true });
+});
+
 app.use(express.json());
 
 // ── CONFIG ────────────────────────────────────────────────────────────────────
