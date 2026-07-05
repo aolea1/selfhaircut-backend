@@ -609,8 +609,8 @@ async function callClaudeVision(base64, mediaType, systemPrompt, userText) {
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1200,
+      model: 'claude-sonnet-4-5-20251001',
+      max_tokens: 1500,
       system: systemPrompt,
       messages: [{ role: 'user', content: [
         { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
@@ -618,10 +618,17 @@ async function callClaudeVision(base64, mediaType, systemPrompt, userText) {
       ]}],
     }),
   });
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Claude API ${response.status}: ${errText.slice(0, 200)}`);
+  }
   const data = await response.json();
   if (data.error) throw new Error(data.error.message);
   const raw = data.content.map(c => c.text || '').join('');
-  return JSON.parse(raw.replace(/```json|```/g, '').trim());
+  // Extract JSON object even if Claude wraps it in markdown or adds surrounding text
+  const jsonMatch = raw.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) throw new Error('No JSON found in Claude response');
+  return JSON.parse(jsonMatch[0]);
 }
 
 app.post('/barber-report', upload.single('photo'), async (req, res) => {
