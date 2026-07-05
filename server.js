@@ -168,10 +168,12 @@ Return ONLY valid JSON — no markdown, no extra text:
 }`;
 
 const PREVIEW_PROMPT =
-  'Give this person a clean low taper fade and a natural sharp lineup. ' +
-  'Keep everything else exactly the same: face, skin tone, expression, head shape, ' +
-  'ear position, pose, lighting, background, clothing, beard, and jewelry. ' +
-  'Only the hair changes. Realistic and achievable — not celebrity-perfect.';
+  'Apply a realistic low taper fade to this person\'s hair. ' +
+  'The sideburn and lower temple area near the ear should be shaved very short, fading smoothly upward into the natural hair length. ' +
+  'The bald/skin line sits at the bottom of the ear. Hair gradually gets longer moving up the head. ' +
+  'The sideburn should be clean and sharp. No hair below the taper line. ' +
+  'Keep everything else completely unchanged: face, skin tone, expression, head shape, ear, pose, lighting, background, clothing. ' +
+  'Only modify the hair in the taper/sideburn zone. Photorealistic result.';
 
 // ── HEALTH ────────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
