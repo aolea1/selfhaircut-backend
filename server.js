@@ -387,16 +387,34 @@ app.post('/use-credit', requireAuth, async (req, res) => {
     }
     if (promoOnly) return res.json({ credits: userData.credits ?? 0, promoExpired: true });
 
-    // 2. Free guide — only if freeGuideUsed is explicitly false
-    //    Undefined means existing user before this field existed → treat as used.
+    // 2a. Free guide — start new session (freeGuideUsed must be explicitly false)
+    //     Undefined means existing user before this field → treat as expired.
     if (userData.freeGuideUsed === false) {
+      const now       = Date.now();
+      const expiresAt = now + 3600000; // 1 hour session
       if (adminDb) {
-        await adminDb.collection('users').doc(uid).update({ freeGuideUsed: true });
+        await adminDb.collection('users').doc(uid).update({
+          freeGuideUsed: true,
+          freeGuideStartedAt: now,
+          freeGuideExpiresAt: expiresAt,
+        });
       } else {
-        await fsPatch('users', uid, { freeGuideUsed: { booleanValue: true } }, token);
+        await fsPatch('users', uid, {
+          freeGuideUsed:      { booleanValue: true },
+          freeGuideStartedAt: { integerValue: String(now) },
+          freeGuideExpiresAt: { integerValue: String(expiresAt) },
+        }, token);
       }
-      console.log(`[/use-credit] uid=${uid} used free guide`);
-      return res.json({ credits: userData.credits ?? 0, usedFreeGuide: true });
+      const minutesRemaining = 60;
+      console.log(`[/use-credit] uid=${uid} started free guide session, expires=${new Date(expiresAt).toISOString()}`);
+      return res.json({ credits: userData.credits ?? 0, usedFreeGuide: true, freeGuideExpiresAt: expiresAt, minutesRemaining });
+    }
+
+    // 2b. Free guide session still active (within 1-hour window)
+    if (userData.freeGuideUsed === true && userData.freeGuideExpiresAt > Date.now()) {
+      const minutesRemaining = Math.ceil((userData.freeGuideExpiresAt - Date.now()) / 60000);
+      console.log(`[/use-credit] uid=${uid} free guide active, ${minutesRemaining}m remaining`);
+      return res.json({ credits: userData.credits ?? 0, freeGuideActive: true, freeGuideExpiresAt: userData.freeGuideExpiresAt, minutesRemaining });
     }
 
     // 3. Credits
@@ -416,6 +434,35 @@ app.post('/use-credit', requireAuth, async (req, res) => {
 
   } catch(err) {
     console.error('[/use-credit]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── FREE GUIDE STATUS ─────────────────────────────────────────────────────────
+app.get('/free-guide-status', verifyToken, async (req, res) => {
+  const uid   = req.uid;
+  const token = req.idToken;
+  try {
+    let userData = {};
+    if (adminDb) {
+      const snap = await adminDb.collection('users').doc(uid).get();
+      userData   = snap.exists ? snap.data() : {};
+    } else {
+      const snap = await fsGet('users', uid, token);
+      userData   = snap ? fromFsFields(snap.fields || {}) : {};
+    }
+
+    const now = Date.now();
+    if (userData.freeGuideUsed === false) {
+      return res.json({ status: 'available' });
+    }
+    if (userData.freeGuideUsed === true && userData.freeGuideExpiresAt > now) {
+      const minutesRemaining = Math.ceil((userData.freeGuideExpiresAt - now) / 60000);
+      return res.json({ status: 'active', minutesRemaining, freeGuideExpiresAt: userData.freeGuideExpiresAt });
+    }
+    return res.json({ status: 'expired' });
+  } catch(err) {
+    console.error('[/free-guide-status]', err.message);
     res.status(500).json({ error: err.message });
   }
 });
