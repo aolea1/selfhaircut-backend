@@ -564,30 +564,42 @@ Return ONLY valid JSON — no markdown, no extra text. If you cannot confidently
   ]
 }`;
 
-const GRADE_FADE_PROMPT = `You are an expert barber grading a finished self-haircut. Analyze the photo honestly and accurately. Only comment on what you can genuinely see.
+const GRADE_FADE_PROMPT = `You are an expert barber reviewing a finished self-haircut photo. Your job is to COACH, not to reject.
 
-Return ONLY valid JSON — no markdown, no extra text:
+CRITICAL RULE: You MUST always return the JSON below — even if the photo is imperfect, angled, close-up, or lower quality. Only set "unusable": true if the image is completely black, completely blurred beyond any recognition, shows no head or hair at all, or is clearly not a haircut photo. Everything else should be analyzed.
+
+For finished-fade grading you only need to see: the sideburn area, around the ear, the fade/blend zone, and the neckline or temple. Close-up shots, angled shots, phone-camera quality, and imperfect lighting are all acceptable as long as some fade area is visible.
+
+Assess "confidence" based on photo quality:
+- "high": clear side profile, good light, fade area fully visible
+- "medium": slightly angled, close-up, or moderate lighting — still very usable
+- "low": significantly obscured, very dim, or partially cut off — analyze anyway, note the limitation
+
+Return ONLY valid JSON, no markdown, no extra text:
 
 {
+  "unusable": false,
+  "unusableReason": null,
+  "confidence": "high",
   "guidelinePlacement": {
     "score": 0-100,
-    "assessment": "Was the taper placed in the right position? 1-2 sentences."
+    "assessment": "Where the taper sits — is it placed at a natural, flattering height? 1-2 sentences."
   },
   "blendQuality": {
     "score": 0-100,
-    "assessment": "How smooth is the transition? 1-2 sentences."
+    "assessment": "How smooth is the gradient from skin/bald to longer hair? 1-2 sentences."
   },
   "sideburnShape": {
     "score": 0-100,
-    "assessment": "Is the shape clean and balanced? 1 sentence."
+    "assessment": "Shape, symmetry, and cleanliness of the sideburn. 1 sentence."
   },
   "fadeConsistency": {
     "score": 0-100,
-    "assessment": "Are there uneven spots? 1-2 sentences."
+    "assessment": "Are there blotchy, uneven, or skipped patches? 1-2 sentences."
   },
   "cleanupQuality": {
     "score": 0-100,
-    "assessment": "Are edges and details clean? 1 sentence."
+    "assessment": "Edge clarity, detail work around ear and neck. 1 sentence."
   },
   "overallScore": 0-100,
   "whatYouDidWell": [
@@ -595,10 +607,14 @@ Return ONLY valid JSON — no markdown, no extra text:
     "Specific positive observation 2",
     "Specific positive observation 3"
   ],
-  "biggestImprovement": "The single most impactful thing they can improve next time. Be specific.",
-  "barberRecommendation": "Specific actionable advice for their next haircut. 1-2 sentences.",
-  "motivationalNote": "Encouraging closing note. Acknowledge effort, point toward progress. 1-2 sentences."
-}`;
+  "biggestImprovement": "The single most impactful change for next time. Be concrete and specific.",
+  "barberRecommendation": "One actionable tip they can apply at their next cut. 1-2 sentences.",
+  "motivationalNote": "Encouraging closing note — acknowledge effort and point toward progress. 1-2 sentences."
+}
+
+If confidence is "low", mention it naturally in one of the assessments, e.g. "The photo angle made it harder to judge the blend precisely — a direct side-profile shot would sharpen the score."
+
+Never return plain text. Never refuse. Always return the JSON.`;
 
 async function callClaudeVision(base64, mediaType, systemPrompt, userText) {
   const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -650,10 +666,14 @@ app.post('/grade-fade', upload.single('photo'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No photo uploaded' });
     if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'AI not configured' });
-    const base64 = req.file.buffer.toString('base64');
+    const base64   = req.file.buffer.toString('base64');
     const mediaType = req.file.mimetype || 'image/jpeg';
-    const result = await callClaudeVision(base64, mediaType, GRADE_FADE_PROMPT,
-      'Grade this finished haircut honestly. Return the analysis JSON.');
+    const result   = await callClaudeVision(base64, mediaType, GRADE_FADE_PROMPT,
+      'Analyze this finished haircut photo and return the JSON. Be forgiving — coach, do not reject.');
+    // If Claude says the image is truly unusable, surface that clearly without a 500
+    if (result.unusable === true) {
+      return res.status(422).json({ error: 'unusable_photo', reason: result.unusableReason || 'Photo not usable' });
+    }
     res.json(result);
   } catch(err) {
     console.error('[/grade-fade]', err.message);
