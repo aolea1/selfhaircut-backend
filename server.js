@@ -117,7 +117,7 @@ try {
 }
 
 // ── FIREBASE REST HELPERS ─────────────────────────────────────────────────────
-// Verify a Firebase ID token and return { uid, email }
+// Verify a Firebase ID token and return { uid, email, emailVerified }
 async function verifyFirebaseToken(idToken) {
   const res = await fetch(
     `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${FIREBASE_API_KEY}`,
@@ -131,7 +131,27 @@ async function verifyFirebaseToken(idToken) {
   if (!res.ok || data.error) throw new Error(data.error?.message || 'Token verification failed');
   const user = data.users?.[0];
   if (!user) throw new Error('User not found');
-  return { uid: user.localId, email: user.email || '' };
+  return { uid: user.localId, email: user.email || '', emailVerified: user.emailVerified === true };
+}
+
+// ── OWNER ACCESS ──────────────────────────────────────────────────────────────
+// Email is read exclusively from the verified server-side token — never from
+// request body, query params, or any client-supplied value.
+function normalizeEmail(email) {
+  return String(email || '').trim().toLowerCase();
+}
+
+function isOwner(user) {
+  // Support both Admin SDK (email_verified) and REST API (emailVerified) shapes
+  const emailVerified = user?.email_verified === true || user?.emailVerified === true;
+  const authenticatedEmail = normalizeEmail(user?.email);
+  const ownerEmail         = normalizeEmail(process.env.OWNER_EMAIL);
+  return Boolean(
+    emailVerified &&
+    authenticatedEmail &&
+    ownerEmail &&
+    authenticatedEmail === ownerEmail
+  );
 }
 
 const FS = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT}/databases/(default)/documents`;
@@ -200,14 +220,13 @@ async function requireAuth(req, res, next) {
   if (!token) return res.status(401).json({ error: 'Missing auth token' });
   try {
     if (adminDb) {
-      // Admin SDK path
       req.user    = await admin.auth().verifyIdToken(token);
       req.idToken = token;
     } else {
-      // REST API path
       req.user    = await verifyFirebaseToken(token);
       req.idToken = token;
     }
+    req.isOwner = isOwner(req.user);
     next();
   } catch(e) {
     console.error('[Auth] Failed:', e.message);
@@ -245,6 +264,29 @@ app.get('/health', (req, res) => {
     openai:       !!openai && !!process.env.OPENAI_API_KEY,
     promoCodes:   Object.keys(getPromoCodes()),
   });
+});
+
+// ── ME — safe access info for the frontend ────────────────────────────────────
+app.get('/me', requireAuth, async (req, res) => {
+  const uid   = req.user.uid;
+  const token = req.idToken;
+  if (req.isOwner) {
+    return res.json({ isOwner: true, hasUnlimitedAccess: true, credits: null });
+  }
+  try {
+    let credits = 0;
+    if (adminDb) {
+      const snap = await adminDb.collection('users').doc(uid).get();
+      credits    = snap.exists ? (snap.data().credits ?? 0) : 0;
+    } else {
+      const snap = await fsGet('users', uid, token);
+      credits    = snap ? (fromFsFields(snap.fields || {}).credits ?? 0) : 0;
+    }
+    res.json({ isOwner: false, hasUnlimitedAccess: false, credits });
+  } catch(err) {
+    console.error('[/me]', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── ANALYZE ───────────────────────────────────────────────────────────────────
@@ -370,6 +412,12 @@ app.post('/use-credit', requireAuth, async (req, res) => {
   const token     = req.idToken;
   const promoOnly = req.body?.promoOnly === true;
 
+  // Owner bypasses all credit / subscription checks
+  if (req.isOwner) {
+    console.log(`[/use-credit] owner bypass uid=${uid}`);
+    return res.json({ isOwner: true, credits: null, hasUnlimitedAccess: true });
+  }
+
   try {
     let userData = {};
     if (adminDb) {
@@ -440,8 +488,9 @@ app.post('/use-credit', requireAuth, async (req, res) => {
 
 // ── FREE GUIDE STATUS ─────────────────────────────────────────────────────────
 app.get('/free-guide-status', requireAuth, async (req, res) => {
-  const uid   = req.uid;
+  const uid   = req.user.uid;
   const token = req.idToken;
+  if (req.isOwner) return res.json({ status: 'owner', isOwner: true });
   try {
     let userData = {};
     if (adminDb) {
@@ -471,8 +520,14 @@ app.get('/free-guide-status', requireAuth, async (req, res) => {
 // Generic single-credit deduction for optional packages (e.g. Fade Finish).
 // Does NOT interact with free-guide session logic.
 app.post('/deduct-credit', requireAuth, async (req, res) => {
-  const uid   = req.uid;
+  const uid   = req.user.uid;
   const token = req.idToken;
+
+  if (req.isOwner) {
+    console.log(`[/deduct-credit] owner bypass uid=${uid}`);
+    return res.json({ isOwner: true, credits: null, hasUnlimitedAccess: true });
+  }
+
   try {
     let userData = {};
     if (adminDb) {
