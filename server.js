@@ -150,6 +150,7 @@ try {
 // ── FIREBASE ADMIN (optional — used only if FIREBASE_SERVICE_ACCOUNT is set) ──
 let admin = null;
 let adminDb = null;
+let _adminInitError = null;
 try {
   if (process.env.FIREBASE_SERVICE_ACCOUNT) {
     admin = require('firebase-admin');
@@ -157,8 +158,12 @@ try {
     if (!admin.apps.length) admin.initializeApp({ credential: admin.credential.cert(sa) });
     adminDb = admin.firestore();
     console.log('[Firebase Admin] Initialized ✓');
+  } else {
+    _adminInitError = 'FIREBASE_SERVICE_ACCOUNT env var is not set';
+    console.warn('[Firebase Admin]', _adminInitError);
   }
 } catch(e) {
+  _adminInitError = e.message;
   console.warn('[Firebase Admin] Unavailable — using REST API fallback:', e.message);
   admin = null; adminDb = null;
 }
@@ -966,7 +971,7 @@ app.post('/feedback', requireAuth, async (req, res) => {
 
 // ── FOUNDER: STATS ────────────────────────────────────────────────────────────
 app.get('/founder/stats', requireAuth, founderRateLimit, requireOwner, async (req, res) => {
-  if (!adminDb) return res.status(503).json({ error: 'Firebase Admin SDK required. Set FIREBASE_SERVICE_ACCOUNT.' });
+  if (!adminDb) return res.status(503).json({ error: 'Firebase Admin SDK required. Set FIREBASE_SERVICE_ACCOUNT.', detail: _adminInitError });
   try {
     const now   = Date.now();
     const range = req.query.range || '30d';
