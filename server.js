@@ -28,6 +28,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     event = stripe.webhooks.constructEvent(req.body, sig, secret);
   } catch (err) {
     console.error('[Webhook] Signature verification failed:', err.message);
+    _health.webhookFails++;
     return res.status(400).json({ error: 'Invalid signature' });
   }
 
@@ -53,6 +54,10 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           { credits: admin.firestore.FieldValue.increment(credits) },
           { merge: true }
         );
+        await adminDb.collection('purchases').add({
+          uid, credits, amountCents, at: Date.now(),
+          stripeSession: session.id,
+        });
         console.log(`[Webhook] ✓ Added ${credits} credits to uid=${uid}`);
       } else {
         // Fallback: REST API with a server token isn't possible without service account.
@@ -69,6 +74,48 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 });
 
 app.use(express.json());
+
+// ── HEALTH TRACKING ───────────────────────────────────────────────────────────
+const _health = {
+  byRoute: {}, recentErrors: [], authFails: 0, webhookFails: 0,
+  startedAt: Date.now(),
+};
+app.use((req, res, next) => {
+  const t = Date.now();
+  res.on('finish', () => {
+    const ms  = Date.now() - t;
+    const key = `${req.method} ${req.path}`;
+    if (!_health.byRoute[key]) _health.byRoute[key] = { count: 0, errors: 0, totalMs: 0 };
+    const r = _health.byRoute[key];
+    r.count++; r.totalMs += ms;
+    if (res.statusCode >= 500) {
+      r.errors++;
+      _health.recentErrors.unshift({ route: key, status: res.statusCode, at: Date.now() });
+      if (_health.recentErrors.length > 100) _health.recentErrors.length = 100;
+    }
+  });
+  next();
+});
+
+// ── RATE LIMITER (founder endpoints) ─────────────────────────────────────────
+const _founderRateMap = new Map();
+function founderRateLimit(req, res, next) {
+  const key  = req.user?.uid || req.ip;
+  const now  = Date.now();
+  const calls = (_founderRateMap.get(key) || []).filter(t => now - t < 60000);
+  if (calls.length >= 60) return res.status(429).json({ error: 'rate_limited' });
+  calls.push(now); _founderRateMap.set(key, calls); next();
+}
+
+// ── REQUIRE OWNER (403 + audit log for non-owners) ────────────────────────────
+function requireOwner(req, res, next) {
+  if (!req.isOwner) {
+    console.warn(`[Founder] UNAUTHORIZED uid=${req.user?.uid} ip=${req.ip} path=${req.path}`);
+    _health.recentErrors.unshift({ route: `FORBIDDEN:${req.path}`, uid: req.user?.uid, at: Date.now() });
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  next();
+}
 
 // ── CONFIG ────────────────────────────────────────────────────────────────────
 // Firebase API key (public — safe to have in code; security enforced by rules)
@@ -230,6 +277,7 @@ async function requireAuth(req, res, next) {
     next();
   } catch(e) {
     console.error('[Auth] Failed:', e.message);
+    _health.authFails++;
     res.status(401).json({ error: 'Invalid or expired token' });
   }
 }
@@ -860,6 +908,322 @@ app.post('/grade-fade', upload.single('photo'), async (req, res) => {
     console.error('[/grade-fade]', err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+// ── LOG EVENT (analytics funnel — fire-and-forget from frontend) ──────────────
+app.post('/log-event', requireAuth, async (req, res) => {
+  const { event, data = {} } = req.body || {};
+  if (!event) return res.status(400).json({ error: 'Missing event' });
+  try {
+    if (adminDb) {
+      await adminDb.collection('analytics_events').add({
+        uid: req.user.uid, event, data, at: Date.now(),
+      });
+    }
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: false }); }
+});
+
+// ── LOG FAILURE (AI analysis failures from frontend) ──────────────────────────
+app.post('/log-failure', requireAuth, async (req, res) => {
+  try {
+    if (adminDb) {
+      await adminDb.collection('failure_logs').add({
+        uid: req.user.uid, ...req.body, at: Date.now(),
+      });
+    }
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: false }); }
+});
+
+// Internal helper to log backend failures
+async function _logFailure(uid, data) {
+  try {
+    if (adminDb) await adminDb.collection('failure_logs').add({ uid, ...data, at: Date.now() });
+  } catch(e) {}
+}
+
+// ── FEEDBACK ──────────────────────────────────────────────────────────────────
+app.post('/feedback', requireAuth, async (req, res) => {
+  const { type, message, feature } = req.body || {};
+  if (!message?.trim()) return res.status(400).json({ error: 'Missing message' });
+  try {
+    const doc = {
+      uid: req.user.uid, email: req.user.email || '',
+      type: type || 'general', feature: feature || null,
+      message: message.trim(), status: 'new', at: Date.now(),
+    };
+    if (adminDb) {
+      const ref = await adminDb.collection('feedback').add(doc);
+      return res.json({ ok: true, id: ref.id });
+    }
+    res.json({ ok: true });
+  } catch(e) {
+    console.error('[/feedback]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── FOUNDER: STATS ────────────────────────────────────────────────────────────
+app.get('/founder/stats', requireAuth, founderRateLimit, requireOwner, async (req, res) => {
+  if (!adminDb) return res.status(503).json({ error: 'Firebase Admin SDK required. Set FIREBASE_SERVICE_ACCOUNT.' });
+  try {
+    const now   = Date.now();
+    const range = req.query.range || '30d';
+    const cutoffs = {
+      today: new Date().setHours(0, 0, 0, 0),
+      '7d':  now - 7 * 864e5,
+      '30d': now - 30 * 864e5,
+      year:  new Date(new Date().getFullYear(), 0, 1).getTime(),
+    };
+    const cutoff = cutoffs[range] ?? cutoffs['30d'];
+
+    const [usersSnap, purchasesSnap, eventsSnap, failSnap] = await Promise.all([
+      adminDb.collection('users').get(),
+      adminDb.collection('purchases').where('at', '>=', cutoff).get(),
+      adminDb.collection('analytics_events').where('at', '>=', cutoff).get(),
+      adminDb.collection('failure_logs').where('at', '>=', cutoff).get(),
+    ]);
+
+    const users   = usersSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const todayMs = new Date().setHours(0, 0, 0, 0);
+    const weekMs  = now - 7 * 864e5;
+    const monthMs = now - 30 * 864e5;
+
+    const totalUsers    = users.length;
+    const newToday      = users.filter(u => (u.createdAt || 0) >= todayMs).length;
+    const newThisWeek   = users.filter(u => (u.createdAt || 0) >= weekMs).length;
+    const newThisMonth  = users.filter(u => (u.createdAt || 0) >= monthMs).length;
+    const promoUsers    = users.filter(u => u.promoAccess?.expiresAt > now).length;
+    const paidUsers     = users.filter(u => (u.credits || 0) > 0).length;
+    const freeUsers     = totalUsers - paidUsers - promoUsers;
+    const outOfCredits  = users.filter(u => (u.credits || 0) === 0 && u.freeGuideUsed === true && !u.promoAccess?.expiresAt).length;
+    const creditBalance = users.reduce((s, u) => s + (u.credits || 0), 0);
+
+    const purchases   = purchasesSnap.docs.map(d => d.data());
+    const totalRevCents  = purchases.reduce((s, p) => s + (p.amountCents || 0), 0);
+    const creditsPurchased = purchases.reduce((s, p) => s + (p.credits || 0), 0);
+
+    const events      = eventsSnap.docs.map(d => d.data());
+    const eventCounts = {};
+    events.forEach(e => { eventCounts[e.event] = (eventCounts[e.event] || 0) + 1; });
+
+    const failures    = failSnap.docs.map(d => d.data());
+    const retryOk     = failures.filter(f => f.retrySucceeded).length;
+
+    res.json({
+      users: { total: totalUsers, newToday, newThisWeek, newThisMonth, free: freeUsers, paid: paidUsers, promo: promoUsers, outOfCredits },
+      revenue: { totalCents: totalRevCents, creditsPurchased },
+      credits: { balance: creditBalance },
+      events:  eventCounts,
+      failures: { total: failures.length, retrySuccesses: retryOk },
+    });
+  } catch(e) {
+    console.error('[/founder/stats]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── FOUNDER: ANALYTICS (funnel + feature breakdown) ───────────────────────────
+app.get('/founder/analytics', requireAuth, founderRateLimit, requireOwner, async (req, res) => {
+  if (!adminDb) return res.status(503).json({ error: 'Firebase Admin SDK required.' });
+  try {
+    const now    = Date.now();
+    const range  = req.query.range || '7d';
+    const cutoffs = { today: new Date().setHours(0,0,0,0), '7d': now-7*864e5, '30d': now-30*864e5, year: new Date(new Date().getFullYear(),0,1).getTime() };
+    const cutoff = cutoffs[range] ?? cutoffs['7d'];
+    const snap   = await adminDb.collection('analytics_events').where('at', '>=', cutoff).get();
+    const events = snap.docs.map(d => d.data());
+
+    const byEvent = {};
+    const byUser  = {};
+    events.forEach(e => {
+      byEvent[e.event] = (byEvent[e.event] || 0) + 1;
+      if (!byUser[e.uid]) byUser[e.uid] = new Set();
+      byUser[e.uid].add(e.event);
+    });
+    const uniqueByEvent = {};
+    Object.values(byUser).forEach(s => s.forEach(evt => { uniqueByEvent[evt] = (uniqueByEvent[evt] || 0) + 1; }));
+
+    const FUNNEL = ['page_view','guide_started','photo_uploaded','step_completed','guide_completed','paywall_viewed','checkout_started','checkout_completed'];
+    const funnel = FUNNEL.map((evt, i) => {
+      const count = uniqueByEvent[evt] || 0;
+      const prev  = i > 0 ? (uniqueByEvent[FUNNEL[i-1]] || 0) : count;
+      return { event: evt, count, pct: prev > 0 ? Math.round((count/prev)*100) : null };
+    });
+
+    const FEATURES = ['low_taper','mid_taper','high_taper','skin_fade','buzz_cut','grade_fade','fade_finish','barber_report','ai_chat'];
+    const features = FEATURES.map(f => ({
+      feature: f,
+      uses: byEvent[`feature_${f}`] || 0,
+      unique: uniqueByEvent[`feature_${f}`] || 0,
+    }));
+
+    res.json({ funnel, features, totalEvents: events.length, uniqueUsers: Object.keys(byUser).length });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── FOUNDER: USER SEARCH ──────────────────────────────────────────────────────
+app.post('/founder/users/search', requireAuth, founderRateLimit, requireOwner, async (req, res) => {
+  if (!adminDb) return res.status(503).json({ error: 'Firebase Admin SDK required.' });
+  const { q } = req.body || {};
+  try {
+    let docs = [];
+    if (q?.includes('@')) {
+      const snap = await adminDb.collection('users').where('email', '==', q.trim().toLowerCase()).limit(10).get();
+      docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      if (docs.length === 0) {
+        try {
+          const au = await admin.auth().getUserByEmail(q.trim());
+          const d  = await adminDb.collection('users').doc(au.uid).get();
+          docs = [{ id: au.uid, email: au.email, displayName: au.displayName, ...(d.exists ? d.data() : {}) }];
+        } catch(e2) {}
+      }
+    } else if (q) {
+      const d = await adminDb.collection('users').doc(q.trim()).get();
+      if (d.exists) docs = [{ id: d.id, ...d.data() }];
+    } else {
+      const snap = await adminDb.collection('users').orderBy('createdAt', 'desc').limit(25).get();
+      docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    }
+    const now = Date.now();
+    const safe = docs.map(({ id, email, displayName, credits, createdAt, disabled, promoAccess, freeGuideUsed }) => ({
+      id, email, displayName, credits: credits || 0, createdAt: createdAt || null,
+      disabled: !!disabled, hasPromo: !!(promoAccess?.expiresAt > now), freeGuideUsed: !!freeGuideUsed,
+    }));
+    res.json({ users: safe });
+  } catch(e) {
+    console.error('[/founder/users/search]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── FOUNDER: USER DETAIL ──────────────────────────────────────────────────────
+app.get('/founder/users/:uid', requireAuth, founderRateLimit, requireOwner, async (req, res) => {
+  if (!adminDb) return res.status(503).json({ error: 'Firebase Admin SDK required.' });
+  try {
+    const uid = req.params.uid;
+    const [doc, authUser, eventsSnap, failSnap] = await Promise.all([
+      adminDb.collection('users').doc(uid).get(),
+      admin.auth().getUser(uid).catch(() => null),
+      adminDb.collection('analytics_events').where('uid','==',uid).orderBy('at','desc').limit(20).get(),
+      adminDb.collection('failure_logs').where('uid','==',uid).orderBy('at','desc').limit(10).get(),
+    ]);
+    if (!doc.exists) return res.status(404).json({ error: 'User not found' });
+    const d = doc.data();
+    res.json({
+      id: uid,
+      email: authUser?.email || d.email,
+      displayName: authUser?.displayName || d.displayName,
+      emailVerified: authUser?.emailVerified ?? false,
+      credits: d.credits || 0,
+      createdAt: d.createdAt || null,
+      disabled: !!d.disabled,
+      disabledReason: d.disabledReason || null,
+      promoAccess: d.promoAccess || null,
+      freeGuideUsed: !!d.freeGuideUsed,
+      freeGuideExpiresAt: d.freeGuideExpiresAt || null,
+      recentEvents: eventsSnap.docs.map(d => d.data()),
+      recentFailures: failSnap.docs.map(d => d.data()),
+    });
+  } catch(e) {
+    console.error('[/founder/users/:uid]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── FOUNDER: GRANT / REMOVE CREDITS ──────────────────────────────────────────
+app.post('/founder/users/grant', requireAuth, founderRateLimit, requireOwner, async (req, res) => {
+  if (!adminDb) return res.status(503).json({ error: 'Firebase Admin SDK required.' });
+  const { uid, delta, reason } = req.body || {};
+  if (!uid || typeof delta !== 'number') return res.status(400).json({ error: 'uid and delta required' });
+  try {
+    const ref  = adminDb.collection('users').doc(uid);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ error: 'User not found' });
+    const newBal = Math.max(0, (snap.data().credits || 0) + delta);
+    await ref.update({ credits: newBal });
+    console.log(`[Founder] grant uid=${uid} delta=${delta} reason=${reason||'-'} newBal=${newBal}`);
+    res.json({ ok: true, credits: newBal });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── FOUNDER: DISABLE / RESTORE ACCOUNT ───────────────────────────────────────
+app.post('/founder/users/disable', requireAuth, founderRateLimit, requireOwner, async (req, res) => {
+  if (!adminDb) return res.status(503).json({ error: 'Firebase Admin SDK required.' });
+  const { uid, disabled, reason } = req.body || {};
+  if (!uid || typeof disabled !== 'boolean') return res.status(400).json({ error: 'uid and disabled required' });
+  try {
+    await Promise.all([
+      adminDb.collection('users').doc(uid).update({ disabled, disabledReason: reason || null }),
+      admin.auth().updateUser(uid, { disabled }),
+    ]);
+    console.log(`[Founder] ${disabled?'DISABLED':'RESTORED'} uid=${uid} reason=${reason||'-'}`);
+    res.json({ ok: true, disabled });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── FOUNDER: FAILURE LOGS ─────────────────────────────────────────────────────
+app.get('/founder/logs', requireAuth, founderRateLimit, requireOwner, async (req, res) => {
+  if (!adminDb) return res.status(503).json({ error: 'Firebase Admin SDK required.' });
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const snap  = await adminDb.collection('failure_logs').orderBy('at', 'desc').limit(limit).get();
+    res.json({ logs: snap.docs.map(d => ({ id: d.id, ...d.data() })) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── FOUNDER: FEEDBACK LIST ────────────────────────────────────────────────────
+app.get('/founder/feedback', requireAuth, founderRateLimit, requireOwner, async (req, res) => {
+  if (!adminDb) return res.status(503).json({ error: 'Firebase Admin SDK required.' });
+  try {
+    const { status } = req.query;
+    let q = adminDb.collection('feedback').orderBy('at', 'desc').limit(100);
+    if (status) q = adminDb.collection('feedback').where('status','==',status).orderBy('at','desc').limit(100);
+    const snap = await q.get();
+    res.json({ feedback: snap.docs.map(d => ({ id: d.id, ...d.data() })) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── FOUNDER: UPDATE FEEDBACK STATUS ──────────────────────────────────────────
+app.patch('/founder/feedback/:id', requireAuth, founderRateLimit, requireOwner, async (req, res) => {
+  if (!adminDb) return res.status(503).json({ error: 'Firebase Admin SDK required.' });
+  const { status } = req.body || {};
+  if (!['new','reviewing','fixed','declined'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
+  try {
+    await adminDb.collection('feedback').doc(req.params.id).update({ status });
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── FOUNDER: SYSTEM HEALTH ────────────────────────────────────────────────────
+app.get('/founder/health', requireAuth, founderRateLimit, requireOwner, (req, res) => {
+  const uptimeMs = Date.now() - _health.startedAt;
+  const routes   = Object.entries(_health.byRoute).map(([route, r]) => ({
+    route,
+    requests: r.count,
+    errors:   r.errors,
+    errorRate: r.count > 0 ? +((r.errors / r.count) * 100).toFixed(1) : 0,
+    avgMs:    r.count > 0 ? Math.round(r.totalMs / r.count) : 0,
+  })).sort((a, b) => b.requests - a.requests);
+
+  res.json({
+    uptime:       uptimeMs,
+    uptimeHuman:  `${Math.floor(uptimeMs/3600000)}h ${Math.floor((uptimeMs%3600000)/60000)}m`,
+    startedAt:    _health.startedAt,
+    authFails:    _health.authFails,
+    webhookFails: _health.webhookFails,
+    routes,
+    recentErrors: _health.recentErrors.slice(0, 30),
+    env: {
+      firebase:   !!adminDb,
+      anthropic:  !!process.env.ANTHROPIC_API_KEY,
+      stripe:     !!process.env.STRIPE_SECRET_KEY,
+      ownerEmail: !!process.env.OWNER_EMAIL,
+    },
+  });
 });
 
 const PORT = process.env.PORT || 3000;
