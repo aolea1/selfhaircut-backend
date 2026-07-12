@@ -697,20 +697,154 @@ Return ONLY valid JSON, no markdown, no extra text:
 Never return plain text. Never refuse. Always return the JSON.`;
 
 app.post('/fade-finish', upload.single('photo'), requireAuth, async (req, res) => {
+  const uid   = req.user.uid;
+  const token = req.idToken;
+  const log   = {
+    uid,
+    isOwner:       req.isOwner,
+    fileReceived:  !!req.file,
+    originalMime:  req.file?.mimetype,
+    originalSize:  req.file?.size,
+    model:         CLAUDE_MODEL,
+    attempt:       0,
+    retried:       false,
+    creditDeducted: false,
+  };
+
   try {
-    if (!req.file) return res.status(400).json({ error: 'No photo uploaded' });
-    if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'AI not configured' });
-    const base64    = req.file.buffer.toString('base64');
-    const mediaType = req.file.mimetype || 'image/jpeg';
-    const result    = await callClaudeVision(base64, mediaType, FADE_FINISH_PROMPT,
-      'Analyze this finished haircut photo and return the full JSON including lineup guidance. Coach, do not reject.');
-    if (result.unusable === true) {
-      return res.status(422).json({ error: 'unusable_photo', reason: result.unusableReason || 'Photo not usable' });
+    if (!req.file) {
+      console.warn('[/fade-finish] no file received', log);
+      return res.status(400).json({ error: 'No photo uploaded' });
     }
-    res.json(result);
+    if (!process.env.ANTHROPIC_API_KEY) {
+      console.error('[/fade-finish] ANTHROPIC_API_KEY not set');
+      return res.status(500).json({ error: 'AI not configured' });
+    }
+
+    // ── Credit pre-check (don't deduct yet) ──────────────────────────────────
+    let currentCredits = null;
+    if (!req.isOwner) {
+      try {
+        let userData = {};
+        if (adminDb) {
+          const snap = await adminDb.collection('users').doc(uid).get();
+          userData   = snap.exists ? snap.data() : {};
+        } else {
+          const snap = await fsGet('users', uid, token);
+          userData   = snap ? fromFsFields(snap.fields || {}) : {};
+        }
+        currentCredits = userData.credits ?? 0;
+        log.creditsBeforeDeduct = currentCredits;
+        if (currentCredits <= 0) {
+          console.log(`[/fade-finish] no credits uid=${uid}`);
+          return res.status(402).json({ error: 'no_credits', credits: 0 });
+        }
+      } catch(creditErr) {
+        console.error('[/fade-finish] credit pre-check error', creditErr.message);
+        return res.status(500).json({ error: 'Could not verify credits' });
+      }
+    }
+
+    // ── Normalize image ───────────────────────────────────────────────────────
+    let processedBuf, processedMime;
+    try {
+      const norm = await normalizeImage(req.file.buffer, req.file.mimetype, log);
+      processedBuf  = norm.buffer;
+      processedMime = norm.mediaType;
+      log.normalized = true;
+    } catch(normErr) {
+      log.normalizeError = normErr.message;
+      console.error('[/fade-finish] image normalization failed', log);
+      // Fall back to raw buffer if sharp fails (e.g. truly corrupt)
+      processedBuf  = req.file.buffer;
+      processedMime = req.file.mimetype || 'image/jpeg';
+    }
+
+    const base64 = processedBuf.toString('base64');
+
+    // ── Attempt 1: full prompt ────────────────────────────────────────────────
+    let result = null;
+    let attempt1Error = null;
+    log.attempt = 1;
+    try {
+      result = await callClaudeVision(
+        base64, processedMime, FADE_FINISH_PROMPT,
+        'Analyze this finished haircut photo and return the full JSON including lineup guidance. Coach, do not reject.'
+      );
+    } catch(err1) {
+      attempt1Error = err1.message;
+      log.attempt1Error     = err1.message;
+      log.attempt1RawJson   = err1.rawJson;
+      log.attempt1RawResponse = err1.rawResponse;
+      console.warn('[/fade-finish] attempt 1 failed', log);
+    }
+
+    // ── Attempt 2: simplified prompt ──────────────────────────────────────────
+    if (!result) {
+      log.attempt  = 2;
+      log.retried  = true;
+      try {
+        result = await callClaudeVision(
+          base64, processedMime, FADE_FINISH_PROMPT_SIMPLE,
+          'Analyze this haircut photo and return the JSON. Be tolerant — work with whatever you can see.',
+          { maxTokens: 800 }
+        );
+        log.usedSimplePrompt = true;
+      } catch(err2) {
+        log.attempt2Error = err2.message;
+        console.error('[/fade-finish] attempt 2 failed — sending fallback', log);
+      }
+    }
+
+    // ── Fallback: no credit deducted ──────────────────────────────────────────
+    if (!result) {
+      console.log('[/fade-finish] returning fallback (no credit deducted)', log);
+      return res.json({
+        fallback: true,
+        creditUsed: false,
+        error: attempt1Error,
+      });
+    }
+
+    // ── Unusable photo ────────────────────────────────────────────────────────
+    if (result.unusable === true) {
+      console.log('[/fade-finish] photo marked unusable by AI', log);
+      return res.status(422).json({
+        error: 'unusable_photo',
+        reason: result.unusableReason || 'Photo not usable',
+      });
+    }
+
+    // ── Deduct credit only on success ─────────────────────────────────────────
+    let creditsAfter = null;
+    if (!req.isOwner) {
+      try {
+        if (adminDb) {
+          await adminDb.collection('users').doc(uid).update({
+            credits: admin.firestore.FieldValue.increment(-1),
+          });
+        } else {
+          await fsPatch('users', uid, { credits: { integerValue: String(currentCredits - 1) } }, token);
+        }
+        creditsAfter = currentCredits - 1;
+        log.creditDeducted = true;
+        log.creditsAfter   = creditsAfter;
+        console.log(`[/fade-finish] success + credit deducted uid=${uid} credits=${creditsAfter}`, log);
+      } catch(deductErr) {
+        log.deductError = deductErr.message;
+        console.error('[/fade-finish] credit deduction failed after successful analysis', log);
+        // Still return the result — don't punish the user for a DB error
+      }
+    } else {
+      console.log(`[/fade-finish] owner — analysis complete, no credit deducted`, log);
+    }
+
+    res.json({ ...result, credits: creditsAfter, creditUsed: !req.isOwner });
+
   } catch(err) {
-    console.error('[/fade-finish]', err.message);
-    res.status(500).json({ error: err.message });
+    log.unexpectedError = err.message;
+    console.error('[/fade-finish] unexpected error', log, err);
+    res.status(500).json({ error: 'Unexpected error during analysis' });
   }
 });
 
@@ -863,36 +997,135 @@ If confidence is "low", mention it naturally in one of the assessments, e.g. "Th
 
 Never return plain text. Never refuse. Always return the JSON.`;
 
-async function callClaudeVision(base64, mediaType, systemPrompt, userText) {
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': process.env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-5-20251001',
-      max_tokens: 1500,
-      system: systemPrompt,
-      messages: [{ role: 'user', content: [
-        { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
-        { type: 'text', text: userText },
-      ]}],
-    }),
-  });
+const CLAUDE_MODEL = 'claude-sonnet-4-5-20251001';
+const CLAUDE_TIMEOUT_MS = 55000;
+
+async function callClaudeVision(base64, mediaType, systemPrompt, userText, opts = {}) {
+  const model     = opts.model || CLAUDE_MODEL;
+  const maxTokens = opts.maxTokens || 1500;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CLAUDE_TIMEOUT_MS);
+
+  let response;
+  try {
+    response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: maxTokens,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: [
+          { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
+          { type: 'text', text: userText },
+        ]}],
+      }),
+    });
+  } catch(fetchErr) {
+    if (fetchErr.name === 'AbortError') throw new Error('TIMEOUT: Claude API did not respond within limit');
+    throw fetchErr;
+  } finally {
+    clearTimeout(timer);
+  }
+
   if (!response.ok) {
     const errText = await response.text();
-    throw new Error(`Claude API ${response.status}: ${errText.slice(0, 200)}`);
+    throw new Error(`CLAUDE_HTTP_${response.status}: ${errText.slice(0, 300)}`);
   }
+
   const data = await response.json();
-  if (data.error) throw new Error(data.error.message);
+  if (data.error) throw new Error(`CLAUDE_API_ERR: ${data.error.message}`);
+
   const raw = data.content.map(c => c.text || '').join('');
-  // Extract JSON object even if Claude wraps it in markdown or adds surrounding text
   const jsonMatch = raw.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error('No JSON found in Claude response');
-  return JSON.parse(jsonMatch[0]);
+  if (!jsonMatch) {
+    const err = new Error('JSON_MISSING: No JSON object in Claude response');
+    err.rawResponse = raw.slice(0, 500);
+    throw err;
+  }
+
+  try {
+    return JSON.parse(jsonMatch[0]);
+  } catch(parseErr) {
+    const err = new Error(`JSON_PARSE: ${parseErr.message}`);
+    err.rawJson = jsonMatch[0].slice(0, 500);
+    throw err;
+  }
 }
+
+// ── IMAGE NORMALIZATION ───────────────────────────────────────────────────────
+const MAX_IMG_DIMENSION = 1600;
+const JPEG_QUALITY      = 82;
+
+async function normalizeImage(buffer, originalMimetype, logCtx) {
+  let workBuf  = buffer;
+  let workMime = originalMimetype || 'image/jpeg';
+
+  // Convert HEIC/HEIF → JPEG (pure-JS, no native lib needed)
+  if (workMime === 'image/heic' || workMime === 'image/heif') {
+    try {
+      const heicConvert = require('heic-convert');
+      workBuf  = Buffer.from(await heicConvert({ buffer: workBuf, format: 'JPEG', quality: 0.9 }));
+      workMime = 'image/jpeg';
+      logCtx.heicConverted = true;
+    } catch(e) {
+      logCtx.heicConvertError = e.message;
+      // Fall through and let sharp try anyway
+    }
+  }
+
+  const sharp = require('sharp');
+  const img   = sharp(workBuf).rotate(); // auto-orient via EXIF
+  const meta  = await img.metadata();
+  logCtx.originalWidth  = meta.width;
+  logCtx.originalHeight = meta.height;
+  logCtx.originalFormat = meta.format;
+
+  // Reject if sharp can't read the image at all
+  if (!meta.width || !meta.height) throw new Error('IMAGE_UNREADABLE: sharp could not decode image');
+
+  // Resize if oversized (keeps aspect ratio, never enlarges)
+  const needsResize = meta.width > MAX_IMG_DIMENSION || meta.height > MAX_IMG_DIMENSION;
+  const pipeline    = needsResize
+    ? img.resize(MAX_IMG_DIMENSION, MAX_IMG_DIMENSION, { fit: 'inside', withoutEnlargement: true })
+    : img;
+  if (needsResize) logCtx.resized = true;
+
+  const outBuf = await pipeline.jpeg({ quality: JPEG_QUALITY, mozjpeg: false }).toBuffer();
+  if (!outBuf || outBuf.length < 1000) throw new Error('IMAGE_EMPTY: processed image is too small to be valid');
+
+  logCtx.processedSize   = outBuf.length;
+  logCtx.processedFormat = 'image/jpeg';
+  logCtx.processedWidth  = needsResize ? Math.round(meta.width  * Math.min(MAX_IMG_DIMENSION/meta.width, MAX_IMG_DIMENSION/meta.height)) : meta.width;
+  logCtx.processedHeight = needsResize ? Math.round(meta.height * Math.min(MAX_IMG_DIMENSION/meta.width, MAX_IMG_DIMENSION/meta.height)) : meta.height;
+
+  return { buffer: outBuf, mediaType: 'image/jpeg' };
+}
+
+// Simplified retry prompt — less strict JSON, shorter, more tolerant
+const FADE_FINISH_PROMPT_SIMPLE = `You are a barber reviewing a finished haircut photo. Coach the person — do not reject.
+
+Analyze whatever you can see. Return ONLY valid JSON, nothing else:
+
+{
+  "unusable": false,
+  "confidence": "medium",
+  "overallScore": 60,
+  "strengths": ["One strength you can observe"],
+  "areasToImprove": ["One area to improve"],
+  "biggestImprovement": "The main thing to fix next time.",
+  "barberRecommendation": "One concrete tip.",
+  "motivationalNote": "Short encouragement.",
+  "zones": [],
+  "lineup": {}
+}
+
+Only set unusable:true if there is literally no hair visible at all.`;
 
 app.post('/barber-report', upload.single('photo'), async (req, res) => {
   try {
