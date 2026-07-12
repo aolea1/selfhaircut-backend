@@ -622,6 +622,11 @@ Assess "confidence" based on photo quality:
 
 For areas you cannot see (front hairline, beard, etc.) — do not guess. Use null for the score and say "Not visible in this photo."
 
+For "zones": identify 3–6 specific spots on the photo to mark up. Use fractional coordinates where x=0 is the left edge, x=1 is the right edge, y=0 is the top, y=1 is the bottom of the image. Each zone gets:
+- "color": "green" (looks good), "yellow" (minor improvement), or "red" (needs correction)
+- "label": short barber instruction like "Flick out here", "Blend upward", "Remove weight line", "Good blend", "Clean edge", "Dark spot — blend more"
+- "arrowDir": "up", "down", "left", "right", or null
+
 Return ONLY valid JSON, no markdown, no extra text:
 
 {
@@ -629,6 +634,15 @@ Return ONLY valid JSON, no markdown, no extra text:
   "unusableReason": null,
   "confidence": "high",
   "overallScore": 0-100,
+  "strengths": [
+    "Specific strength observed in the photo",
+    "Specific strength observed in the photo",
+    "Specific strength observed in the photo"
+  ],
+  "areasToImprove": [
+    "Specific issue to fix, with location",
+    "Specific issue to fix, with location"
+  ],
   "guidelinePlacement": {
     "score": 0-100,
     "assessment": "Where the taper/fade sits — natural, flattering height? 1-2 sentences."
@@ -649,14 +663,13 @@ Return ONLY valid JSON, no markdown, no extra text:
     "score": 0-100,
     "assessment": "Edge clarity around ear and neck. 1 sentence."
   },
-  "whatYouDidWell": [
-    "Specific positive observation",
-    "Specific positive observation",
-    "Specific positive observation"
-  ],
   "biggestImprovement": "The single most impactful thing to improve next time. Be concrete.",
   "barberRecommendation": "One actionable tip for their next cut. 1-2 sentences.",
   "motivationalNote": "Encouraging closing note. 1-2 sentences.",
+  "zones": [
+    { "x": 0.3, "y": 0.6, "color": "yellow", "label": "Blend this upward", "arrowDir": "up" },
+    { "x": 0.55, "y": 0.7, "color": "green", "label": "Good blend here", "arrowDir": null }
+  ],
   "lineup": {
     "frontHairline": {
       "visible": true,
