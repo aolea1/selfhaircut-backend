@@ -343,35 +343,105 @@ app.get('/me', requireAuth, async (req, res) => {
 });
 
 // ── ANALYZE ───────────────────────────────────────────────────────────────────
-app.post('/analyze', upload.single('photo'), async (req, res) => {
+// ── SHARED ANALYSIS HELPER ────────────────────────────────────────────────────
+// Runs attempt 1 with full prompt, attempt 2 with simplified prompt on failure.
+// Returns { result, log } where result is null if both attempts failed.
+async function runWithRetry(endpoint, buffer, mimetype, fullPrompt, fullText, simplePrompt, simpleText, extraLog = {}) {
+  const log = {
+    endpoint,
+    fileReceived:   true,
+    originalMime:   mimetype,
+    originalSize:   buffer.length,
+    model:          CLAUDE_MODEL,
+    attempt:        0,
+    retried:        false,
+    ...extraLog,
+  };
+
+  // Normalize image
+  let base64, processedMime;
   try {
-    if (!req.file) return res.status(400).json({ error: 'No photo uploaded' });
-    const base64    = req.file.buffer.toString('base64');
-    const mediaType = req.file.mimetype || 'image/jpeg';
-    const response  = await fetch('https://api.anthropic.com/v1/messages', {
-      method:  'POST',
-      headers: {
-        'Content-Type':      'application/json',
-        'x-api-key':         process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514', max_tokens: 1000, system: SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: [
-          { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
-          { type: 'text',  text: 'Place the low taper guide line just below the sideburn. Return only JSON.' },
-        ]}],
-      }),
-    });
-    const data   = await response.json();
-    if (data.error) return res.status(500).json({ error: data.error.message });
-    const raw    = data.content.map(c => c.text || '').join('');
-    const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
-    res.json(parsed);
-  } catch(err) {
-    console.error('[/analyze]', err);
-    res.status(500).json({ error: err.message });
+    const norm    = await normalizeImage(buffer, mimetype, log);
+    base64        = norm.buffer.toString('base64');
+    processedMime = norm.mediaType;
+    log.normalized = true;
+  } catch(normErr) {
+    log.normalizeError = normErr.message;
+    console.error(`[${endpoint}] image normalization failed`, log);
+    base64        = buffer.toString('base64');
+    processedMime = mimetype || 'image/jpeg';
   }
+
+  // Attempt 1
+  let result = null;
+  log.attempt = 1;
+  try {
+    result = await callClaudeVision(base64, processedMime, fullPrompt, fullText);
+    log.attempt1Success = true;
+  } catch(err1) {
+    log.attempt1Error       = err1.message;
+    log.attempt1RawResponse = err1.rawResponse;
+    log.attempt1RawJson     = err1.rawJson;
+    console.warn(`[${endpoint}] attempt 1 failed`, log);
+  }
+
+  // Attempt 2
+  if (!result) {
+    log.attempt = 2;
+    log.retried = true;
+    try {
+      result = await callClaudeVision(base64, processedMime, simplePrompt, simpleText, { maxTokens: 800 });
+      log.attempt2Success  = true;
+      log.usedSimplePrompt = true;
+    } catch(err2) {
+      log.attempt2Error       = err2.message;
+      log.attempt2RawResponse = err2.rawResponse;
+      log.attempt2RawJson     = err2.rawJson;
+      console.error(`[${endpoint}] attempt 2 failed`, log);
+    }
+  }
+
+  if (result) console.log(`[${endpoint}] success attempt=${log.attempt}`, log);
+  return { result, log };
+}
+
+// Classify an error string into a user-facing reason code
+function classifyError(msg = '') {
+  if (msg.includes('TIMEOUT'))              return 'timeout';
+  if (msg.includes('CLAUDE_HTTP_529'))      return 'overloaded';
+  if (msg.includes('CLAUDE_HTTP_5'))        return 'api_error';
+  if (msg.includes('CLAUDE_HTTP_4'))        return 'api_client_error';
+  if (msg.includes('JSON_MISSING') || msg.includes('JSON_PARSE')) return 'bad_response';
+  if (msg.includes('IMAGE_UNREADABLE') || msg.includes('IMAGE_EMPTY')) return 'unreadable_image';
+  if (msg.includes('ANTHROPIC_API_KEY'))    return 'not_configured';
+  return 'unknown';
+}
+
+app.post('/analyze', upload.single('photo'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No photo uploaded', reason: 'no_file' });
+  if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'AI not configured', reason: 'not_configured' });
+
+  const ANALYZE_SIMPLE = `You are SelfHaircut.ai. Place a taper guide line on the photo.
+Return ONLY valid JSON: {"lineYFrac":0.5,"startXFrac":0.05,"endXFrac":0.95,"earTopFrac":0.38,"earMidFrac":0.5}`;
+
+  const { result, log } = await runWithRetry(
+    '/analyze',
+    req.file.buffer,
+    req.file.mimetype,
+    SYSTEM_PROMPT,
+    'Place the low taper guide line just below the sideburn. Return only JSON.',
+    ANALYZE_SIMPLE,
+    'Place the taper guide line. Return only the JSON object, nothing else.'
+  ).catch(err => {
+    console.error('[/analyze] runWithRetry threw', err.message);
+    return { result: null, log: { endpoint: '/analyze', unexpectedError: err.message } };
+  });
+
+  if (!result) {
+    const reason = classifyError(log.attempt2Error || log.attempt1Error || '');
+    return res.status(500).json({ error: 'Analysis failed after retry', reason, log });
+  }
+  res.json(result);
 });
 
 // ── GENERATE PREVIEW ──────────────────────────────────────────────────────────
@@ -1127,38 +1197,60 @@ Analyze whatever you can see. Return ONLY valid JSON, nothing else:
 
 Only set unusable:true if there is literally no hair visible at all.`;
 
+const BARBER_REPORT_SIMPLE = `You are a barber reviewing a side-profile photo. Return ONLY valid JSON:
+{"hairLength":"medium","hairTexture":"straight","currentFadeLevel":"none","growthPattern":"normal",
+"recommendedGuards":{"bottom":"0","mid":"1","top":"2"},"keyObservations":["One thing you can see"],
+"warnings":[],"confidence":"medium"}`;
+
 app.post('/barber-report', upload.single('photo'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'No photo uploaded' });
-    if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'AI not configured' });
-    const base64 = req.file.buffer.toString('base64');
-    const mediaType = req.file.mimetype || 'image/jpeg';
-    const result = await callClaudeVision(base64, mediaType, BARBER_REPORT_PROMPT,
-      'Analyze this side-profile photo and return the barber report JSON. Be accurate and honest.');
-    res.json(result);
-  } catch(err) {
-    console.error('[/barber-report]', err.message);
-    res.status(500).json({ error: err.message });
+  if (!req.file) return res.status(400).json({ error: 'No photo uploaded', reason: 'no_file' });
+  if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'AI not configured', reason: 'not_configured' });
+
+  const { result, log } = await runWithRetry(
+    '/barber-report',
+    req.file.buffer,
+    req.file.mimetype,
+    BARBER_REPORT_PROMPT,
+    'Analyze this side-profile photo and return the barber report JSON. Be accurate and honest.',
+    BARBER_REPORT_SIMPLE,
+    'Analyze this hair photo. Return only the JSON object.'
+  ).catch(err => ({ result: null, log: { unexpectedError: err.message } }));
+
+  if (!result) {
+    const reason = classifyError(log.attempt2Error || log.attempt1Error || '');
+    return res.status(500).json({ error: 'Barber report failed after retry', reason, log });
   }
+  res.json(result);
 });
 
+const GRADE_FADE_SIMPLE = `You are a barber grading a finished fade. Coach, do not reject. Return ONLY valid JSON:
+{"unusable":false,"overallScore":65,"grade":"B","strengths":["Visible effort"],
+"areasToImprove":["Blend above the ear"],"biggestImprovement":"Work the mid section more.",
+"barberRecommendation":"Use a flicking motion upward.","motivationalNote":"Keep going — this is fixable.",
+"confidence":"medium","zones":[]}`;
+
 app.post('/grade-fade', upload.single('photo'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'No photo uploaded' });
-    if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'AI not configured' });
-    const base64   = req.file.buffer.toString('base64');
-    const mediaType = req.file.mimetype || 'image/jpeg';
-    const result   = await callClaudeVision(base64, mediaType, GRADE_FADE_PROMPT,
-      'Analyze this finished haircut photo and return the JSON. Be forgiving — coach, do not reject.');
-    // If Claude says the image is truly unusable, surface that clearly without a 500
-    if (result.unusable === true) {
-      return res.status(422).json({ error: 'unusable_photo', reason: result.unusableReason || 'Photo not usable' });
-    }
-    res.json(result);
-  } catch(err) {
-    console.error('[/grade-fade]', err.message);
-    res.status(500).json({ error: err.message });
+  if (!req.file) return res.status(400).json({ error: 'No photo uploaded', reason: 'no_file' });
+  if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'AI not configured', reason: 'not_configured' });
+
+  const { result, log } = await runWithRetry(
+    '/grade-fade',
+    req.file.buffer,
+    req.file.mimetype,
+    GRADE_FADE_PROMPT,
+    'Analyze this finished haircut photo and return the JSON. Be forgiving — coach, do not reject.',
+    GRADE_FADE_SIMPLE,
+    'Grade this haircut photo. Return only the JSON object. Be tolerant — work with whatever you can see.'
+  ).catch(err => ({ result: null, log: { unexpectedError: err.message } }));
+
+  if (!result) {
+    const reason = classifyError(log.attempt2Error || log.attempt1Error || '');
+    return res.status(500).json({ error: 'Grade failed after retry', reason, log });
   }
+  if (result.unusable === true) {
+    return res.status(422).json({ error: 'unusable_photo', reason: result.unusableReason || 'Photo not usable', log });
+  }
+  res.json(result);
 });
 
 // ── LOG EVENT (analytics funnel — fire-and-forget from frontend) ──────────────
