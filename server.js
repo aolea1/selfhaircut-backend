@@ -346,7 +346,17 @@ app.get('/me', requireAuth, async (req, res) => {
 // ── SHARED ANALYSIS HELPER ────────────────────────────────────────────────────
 // Runs attempt 1 with full prompt, attempt 2 with simplified prompt on failure.
 // Returns { result, log } where result is null if both attempts failed.
+// Persist an AI request record to Firestore (best-effort, never throws)
+async function _saveAiRequest(record) {
+  try {
+    if (adminDb) {
+      await adminDb.collection('ai_requests').add({ ...record, at: Date.now() });
+    }
+  } catch(e) { /* non-fatal */ }
+}
+
 async function runWithRetry(endpoint, buffer, mimetype, fullPrompt, fullText, simplePrompt, simpleText, extraLog = {}) {
+  const startedAt = Date.now();
   const log = {
     endpoint,
     fileReceived:   true,
@@ -374,34 +384,68 @@ async function runWithRetry(endpoint, buffer, mimetype, fullPrompt, fullText, si
 
   // Attempt 1
   let result = null;
+  const t1 = Date.now();
   log.attempt = 1;
   try {
     result = await callClaudeVision(base64, processedMime, fullPrompt, fullText);
-    log.attempt1Success = true;
+    log.attempt1Success  = true;
+    log.attempt1Ms       = Date.now() - t1;
   } catch(err1) {
     log.attempt1Error       = err1.message;
-    log.attempt1RawResponse = err1.rawResponse;
-    log.attempt1RawJson     = err1.rawJson;
+    log.attempt1RawResponse = err1.rawResponse?.slice(0, 800);
+    log.attempt1RawJson     = err1.rawJson?.slice(0, 800);
+    log.attempt1Ms          = Date.now() - t1;
+    log.errorCategory       = classifyError(err1.message);
     console.warn(`[${endpoint}] attempt 1 failed`, log);
   }
 
   // Attempt 2
   if (!result) {
+    const t2 = Date.now();
     log.attempt = 2;
     log.retried = true;
     try {
       result = await callClaudeVision(base64, processedMime, simplePrompt, simpleText, { maxTokens: 800 });
       log.attempt2Success  = true;
+      log.attempt2Ms       = Date.now() - t2;
       log.usedSimplePrompt = true;
     } catch(err2) {
       log.attempt2Error       = err2.message;
-      log.attempt2RawResponse = err2.rawResponse;
-      log.attempt2RawJson     = err2.rawJson;
+      log.attempt2RawResponse = err2.rawResponse?.slice(0, 800);
+      log.attempt2RawJson     = err2.rawJson?.slice(0, 800);
+      log.attempt2Ms          = Date.now() - t2;
+      log.errorCategory       = classifyError(err2.message);
       console.error(`[${endpoint}] attempt 2 failed`, log);
     }
   }
 
-  if (result) console.log(`[${endpoint}] success attempt=${log.attempt}`, log);
+  log.totalMs = Date.now() - startedAt;
+  log.success = !!result;
+
+  // Persist to Firestore (non-blocking)
+  _saveAiRequest({
+    endpoint,
+    uid:            log.uid || null,
+    success:        log.success,
+    retried:        log.retried,
+    model:          log.model,
+    totalMs:        log.totalMs,
+    attempt1Ms:     log.attempt1Ms,
+    attempt2Ms:     log.attempt2Ms,
+    originalMime:   log.originalMime,
+    originalSize:   log.originalSize,
+    processedSize:  log.processedSize,
+    originalWidth:  log.originalWidth,
+    originalHeight: log.originalHeight,
+    errorCategory:  log.errorCategory || null,
+    attempt1Error:  log.attempt1Error || null,
+    attempt2Error:  log.attempt2Error || null,
+    attempt1Raw:    log.attempt1RawResponse || null,
+    attempt2Raw:    log.attempt2RawResponse || null,
+    normalizeError: log.normalizeError || null,
+  });
+
+  if (result) console.log(`[${endpoint}] success attempt=${log.attempt} totalMs=${log.totalMs}`, log);
   return { result, log };
 }
 
@@ -1567,6 +1611,23 @@ app.get('/founder/health', requireAuth, founderRateLimit, requireOwner, (req, re
       ownerEmail: !!process.env.OWNER_EMAIL,
     },
   });
+});
+
+// ── FOUNDER: AI REQUEST LOG ────────────────────────────────────────────────────
+app.get('/founder/ai-requests', requireAuth, founderRateLimit, requireOwner, async (req, res) => {
+  if (!adminDb) return res.status(503).json({ error: 'Firebase Admin SDK required.', detail: _adminInitError });
+  try {
+    const limit  = Math.min(parseInt(req.query.limit) || 50, 200);
+    const snap   = await adminDb.collection('ai_requests')
+      .orderBy('at', 'desc')
+      .limit(limit)
+      .get();
+    const items = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    res.json({ items });
+  } catch(e) {
+    console.error('[/founder/ai-requests]', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
