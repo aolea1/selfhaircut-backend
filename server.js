@@ -287,6 +287,7 @@ async function requireAuth(req, res, next) {
   }
 }
 
+// ── LEGACY V1 ANALYZE PROMPT (used when FEATURE_AUTO_PLACEMENT is off) ────────
 const SYSTEM_PROMPT = `You are SelfHaircut.ai, an expert AI barber assistant specializing in self-haircuts.
 Return ONLY valid JSON — no markdown, no extra text:
 {
@@ -300,6 +301,165 @@ Return ONLY valid JSON — no markdown, no extra text:
   "confidence": <"high"|"medium"|"low">
 }`;
 
+// ── V2 AUTO-PLACEMENT PROMPT (used when FEATURE_AUTO_PLACEMENT=true) ──────────
+// All coordinates are normalized fractions 0.0–1.0 relative to the FULL
+// original uploaded image. x=0 is left edge, x=1 is right edge,
+// y=0 is top edge, y=1 is bottom edge.
+const ANALYZE_V2_SYSTEM_PROMPT = `You are SelfHaircut.ai — an expert AI barber specializing in self-administered tapers and fades.
+
+Analyze the side-profile photo and return precise placement data for a low taper fade guide.
+
+Return ONLY a single valid JSON object — no markdown fences, no explanation, nothing else.
+
+═══ COORDINATE SYSTEM ═══
+• All values are fractions 0.0–1.0 relative to the FULL original uploaded image
+• x=0 is the LEFT edge, x=1 is the RIGHT edge
+• y=0 is the TOP edge, y=1 is the BOTTOM edge
+
+═══ SIDE DETECTION ═══
+• "right" side: right side of head is visible, face/nose points LEFT in image, ear is center-right
+• "left" side: left side of head is visible, face/nose points RIGHT in image, ear is center-left
+• For "right" side photos: sideburnX < rearX (sideburn is to the LEFT of the ear, toward the face)
+• For "left" side photos: sideburnX > rearX (sideburn is to the RIGHT of the ear, toward the face)
+
+═══ TAPER PLACEMENT RULES (LOW TAPER) ═══
+1. Identify the visible ear. The vertical midpoint of the ear is the primary anchor.
+2. The GUIDE LINE (bald reference) runs horizontally at ear-mid height, spanning from just in front of the sideburn to just past the ear canal.
+3. The SIDEBURN BOUNDARY is a near-vertical line at the front edge of the sideburn hair:
+   • Bottom point (p0): at guide-line height, at the front edge of the sideburn
+   • Top point (p1): at or just above the top of the ear, same X as bottom (slightly tapered)
+4. The REAR BOUNDARY is a near-vertical line just behind the ear canal:
+   • Bottom point (p0): at guide-line height, just past the ear canal
+   • Top point (p1): at or just above the top of the ear, same X as bottom (slightly tapered)
+5. Do NOT push the taper higher than the top of the ear for a LOW taper
+6. Do NOT extend the rear boundary more than ~12% of image width behind the ear canal
+7. Preserve the bulk of top hair — only modify the lower temple and sideburn zone
+8. The four taper points form a trapezoid: wider at the bottom (guide line level), slightly narrower at top
+
+═══ CROP RECOMMENDATION ═══
+• Recommend a crop that tightly frames the head: from just above the hairline to just below the jaw
+• Crop should show the full ear and sideburn clearly
+• Keep some breathing room — don't crop too tight against the edges
+• Minimum crop dimensions: widthFrac ≥ 0.20, heightFrac ≥ 0.25
+
+═══ CONFIDENCE SCORING ═══
+• 0.85–1.00: ear clearly visible, head fully sideways (true side profile), sideburn in frame, good lighting
+• 0.60–0.84: ear mostly visible but may have slight occlusion, small angle variation (up to ~20° off true side), or mild lighting issue — still usable
+• 0.00–0.59: ear not visible, head too frontal (more than ~30° off true side), poor lighting, blurry, or sideburn out of frame
+
+═══ JSON SCHEMA ═══
+{
+  "valid": <boolean — true if photo is usable for taper placement>,
+  "confidence": <number 0.0–1.0>,
+  "side": <"left" | "right" | "unknown">,
+  "failureReason": <null | "ear_not_visible" | "head_not_sideways" | "sideburn_out_of_frame" | "too_dark_or_blurry" | "hair_covering_landmarks" | "not_a_person" | "not_a_haircut_photo">,
+  "crop": {
+    "xFrac": <left edge of crop>,
+    "yFrac": <top edge of crop>,
+    "widthFrac": <crop width>,
+    "heightFrac": <crop height>
+  },
+  "taperShape": {
+    "sideburnTopXFrac": <x of front-of-sideburn top point>,
+    "sideburnTopYFrac": <y of front-of-sideburn top point — above guide line>,
+    "sideburnBottomXFrac": <x of front-of-sideburn bottom point — at guide line>,
+    "sideburnBottomYFrac": <y of front-of-sideburn bottom point — at guide line height>,
+    "rearTopXFrac": <x of behind-ear top point>,
+    "rearTopYFrac": <y of behind-ear top point — above guide line>,
+    "rearBottomXFrac": <x of behind-ear bottom point — at guide line>,
+    "rearBottomYFrac": <y of behind-ear bottom point — at guide line height>
+  },
+  "guideLine": {
+    "startXFrac": <x of guide line left end — front of sideburn>,
+    "startYFrac": <y of guide line left end — ear mid height>,
+    "endXFrac": <x of guide line right end — just past ear canal>,
+    "endYFrac": <y of guide line right end — ear mid height>
+  },
+  "reasoningSummary": "<one sentence: what you detected and any notable uncertainty>"
+}
+
+CRITICAL: If valid=false OR confidence < 0.60, set taperShape and guideLine to null.
+CRITICAL: sideburnBottomYFrac and rearBottomYFrac must be approximately equal to guideLine startYFrac/endYFrac.
+CRITICAL: sideburnTopYFrac and rearTopYFrac must be LESS than (above) sideburnBottomYFrac and rearBottomYFrac.
+CRITICAL: Return exactly this JSON structure — no extra fields, no markdown, no explanation outside the JSON.`;
+
+const ANALYZE_V2_SIMPLE = `You are a barber AI. Analyze this side-profile photo for haircut taper placement.
+Return ONLY this JSON — fill in real values from the photo, no placeholders:
+{"valid":true,"confidence":0.7,"side":"right","failureReason":null,"crop":{"xFrac":0.05,"yFrac":0.05,"widthFrac":0.9,"heightFrac":0.9},"taperShape":{"sideburnTopXFrac":0.38,"sideburnTopYFrac":0.30,"sideburnBottomXFrac":0.40,"sideburnBottomYFrac":0.50,"rearTopXFrac":0.58,"rearTopYFrac":0.30,"rearBottomXFrac":0.56,"rearBottomYFrac":0.50},"guideLine":{"startXFrac":0.38,"startYFrac":0.50,"endXFrac":0.58,"endYFrac":0.50},"reasoningSummary":"Analyzed the photo."}
+Replace ALL values with ones that actually match the photo. Return only the JSON object.`;
+
+// ── BACKEND VALIDATION FOR V2 ANALYZE RESPONSE ────────────────────────────────
+function validateAnalysisV2(data) {
+  const errors = [];
+  const inRange = v => typeof v === 'number' && isFinite(v) && v >= 0 && v <= 1;
+
+  if (typeof data.valid !== 'boolean')        errors.push('valid must be boolean');
+  if (!inRange(data.confidence))              errors.push('confidence must be number 0–1');
+  if (!['left','right','unknown'].includes(data.side)) errors.push('side must be left|right|unknown');
+
+  // If invalid or low confidence, taperShape/guideLine are allowed to be null
+  if (!data.valid || data.confidence < 0.60) {
+    return { ok: errors.length === 0, errors };
+  }
+
+  // Crop
+  const c = data.crop;
+  if (!c || typeof c !== 'object') {
+    errors.push('crop required when valid=true');
+  } else {
+    if (!inRange(c.xFrac))     errors.push('crop.xFrac out of range');
+    if (!inRange(c.yFrac))     errors.push('crop.yFrac out of range');
+    if (typeof c.widthFrac  !== 'number' || c.widthFrac  < 0.10 || c.widthFrac  > 1) errors.push('crop.widthFrac invalid (min 0.10)');
+    if (typeof c.heightFrac !== 'number' || c.heightFrac < 0.15 || c.heightFrac > 1) errors.push('crop.heightFrac invalid (min 0.15)');
+    if (c.xFrac + c.widthFrac  > 1.02) errors.push('crop extends beyond right edge');
+    if (c.yFrac + c.heightFrac > 1.02) errors.push('crop extends beyond bottom edge');
+  }
+
+  // Guide line
+  const gl = data.guideLine;
+  if (!gl || typeof gl !== 'object') {
+    errors.push('guideLine required when valid=true and confidence>=0.60');
+  } else {
+    ['startXFrac','startYFrac','endXFrac','endYFrac'].forEach(k => {
+      if (!inRange(gl[k])) errors.push(`guideLine.${k} out of range`);
+    });
+    if (typeof gl.startXFrac === 'number' && typeof gl.endXFrac === 'number' &&
+        gl.startXFrac >= gl.endXFrac) {
+      errors.push('guideLine startXFrac must be < endXFrac');
+    }
+  }
+
+  // Taper shape
+  const ts = data.taperShape;
+  if (!ts || typeof ts !== 'object') {
+    errors.push('taperShape required when valid=true and confidence>=0.60');
+  } else {
+    const keys = [
+      'sideburnTopXFrac','sideburnTopYFrac','sideburnBottomXFrac','sideburnBottomYFrac',
+      'rearTopXFrac','rearTopYFrac','rearBottomXFrac','rearBottomYFrac',
+    ];
+    keys.forEach(k => { if (!inRange(ts[k])) errors.push(`taperShape.${k} out of range`); });
+
+    if (errors.length === 0) {
+      // Top must be above bottom (smaller Y = higher on screen)
+      if (ts.sideburnTopYFrac >= ts.sideburnBottomYFrac)
+        errors.push('sideburnTopYFrac must be < sideburnBottomYFrac (top above bottom)');
+      if (ts.rearTopYFrac >= ts.rearBottomYFrac)
+        errors.push('rearTopYFrac must be < rearBottomYFrac (top above bottom)');
+      // Sideburn and rear must not overlap (need minimum horizontal gap)
+      const xGap = Math.abs(ts.sideburnBottomXFrac - ts.rearBottomXFrac);
+      if (xGap < 0.015) errors.push('sideburnBottomX and rearBottomX are too close or overlapping');
+      // Vertical span must be meaningful
+      const sbSpan = ts.sideburnBottomYFrac - ts.sideburnTopYFrac;
+      const rrSpan = ts.rearBottomYFrac    - ts.rearTopYFrac;
+      if (sbSpan < 0.03) errors.push('sideburn taper span too small (< 3% of image height)');
+      if (rrSpan < 0.03) errors.push('rear taper span too small (< 3% of image height)');
+    }
+  }
+
+  return { ok: errors.length === 0, errors };
+}
+
 const PREVIEW_PROMPT =
   'Apply a realistic low taper fade to this person\'s hair. ' +
   'The sideburn and lower temple area near the ear should be shaved very short, fading smoothly upward into the natural hair length. ' +
@@ -311,11 +471,12 @@ const PREVIEW_PROMPT =
 // ── HEALTH ────────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({
-    status:       'ok',
-    firebase:     !!adminDb,
-    firebaseRest: true,
-    openai:       !!openai && !!process.env.OPENAI_API_KEY,
-    promoCodes:   Object.keys(getPromoCodes()),
+    status:          'ok',
+    firebase:        !!adminDb,
+    firebaseRest:    true,
+    openai:          !!openai && !!process.env.OPENAI_API_KEY,
+    autoPlacement:   process.env.FEATURE_AUTO_PLACEMENT === 'true',
+    promoCodes:      Object.keys(getPromoCodes()),
   });
 });
 
@@ -461,23 +622,55 @@ function classifyError(msg = '') {
   return 'unknown';
 }
 
+const AUTO_PLACEMENT_HIGH_CONFIDENCE = 0.85;
+const AUTO_PLACEMENT_MIN_CONFIDENCE  = 0.60;
+
 app.post('/analyze', upload.single('photo'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No photo uploaded', reason: 'no_file' });
   if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'AI not configured', reason: 'not_configured' });
 
-  const ANALYZE_SIMPLE = `You are SelfHaircut.ai. Place a taper guide line on the photo.
+  const useV2 = process.env.FEATURE_AUTO_PLACEMENT === 'true';
+
+  // ── V1 LEGACY PATH ─────────────────────────────────────────────────────────
+  if (!useV2) {
+    const ANALYZE_SIMPLE = `You are SelfHaircut.ai. Place a taper guide line on the photo.
 Return ONLY valid JSON: {"lineYFrac":0.5,"startXFrac":0.05,"endXFrac":0.95,"earTopFrac":0.38,"earMidFrac":0.5}`;
+    const { result, log } = await runWithRetry(
+      '/analyze',
+      req.file.buffer,
+      req.file.mimetype,
+      SYSTEM_PROMPT,
+      'Place the low taper guide line just below the sideburn. Return only JSON.',
+      ANALYZE_SIMPLE,
+      'Place the taper guide line. Return only the JSON object, nothing else.'
+    ).catch(err => {
+      console.error('[/analyze v1] runWithRetry threw', err.message);
+      return { result: null, log: { endpoint: '/analyze', unexpectedError: err.message } };
+    });
+    if (!result) {
+      const reason = classifyError(log.attempt2Error || log.attempt1Error || '');
+      return res.status(500).json({ error: 'Analysis failed after retry', reason, log });
+    }
+    return res.json(result);
+  }
+
+  // ── V2 AUTO-PLACEMENT PATH ─────────────────────────────────────────────────
+  const style       = (req.body && req.body.style) || 'low';
+  const styleNote   = { low: 'low taper', mid: 'mid taper', high: 'high taper', skin: 'skin fade', buzz: 'buzz cut' }[style] || 'low taper';
+  const userText    = `Analyze this photo for a ${styleNote}. Return only the JSON object — no markdown, no extra text.`;
+  const uid         = req.user?.uid || null;
 
   const { result, log } = await runWithRetry(
     '/analyze',
     req.file.buffer,
     req.file.mimetype,
-    SYSTEM_PROMPT,
-    'Place the low taper guide line just below the sideburn. Return only JSON.',
-    ANALYZE_SIMPLE,
-    'Place the taper guide line. Return only the JSON object, nothing else.'
+    ANALYZE_V2_SYSTEM_PROMPT,
+    userText,
+    ANALYZE_V2_SIMPLE,
+    'Analyze this photo for taper placement. Return only the JSON object, nothing else.',
+    { uid, style }
   ).catch(err => {
-    console.error('[/analyze] runWithRetry threw', err.message);
+    console.error('[/analyze v2] runWithRetry threw', err.message);
     return { result: null, log: { endpoint: '/analyze', unexpectedError: err.message } };
   });
 
@@ -485,7 +678,24 @@ Return ONLY valid JSON: {"lineYFrac":0.5,"startXFrac":0.05,"endXFrac":0.95,"earT
     const reason = classifyError(log.attempt2Error || log.attempt1Error || '');
     return res.status(500).json({ error: 'Analysis failed after retry', reason, log });
   }
-  res.json(result);
+
+  // Validate the V2 schema
+  const validation = validateAnalysisV2(result);
+  if (!validation.ok) {
+    console.warn('[/analyze v2] schema validation failed', { errors: validation.errors, result });
+  }
+
+  // Strip reasoningSummary from the client-facing response (stored in Firestore logs, not exposed)
+  const { reasoningSummary, ...clientResult } = result;
+
+  res.json({
+    ...clientResult,
+    _v2:              true,
+    _validationOk:    validation.ok,
+    _validationErrors: validation.ok ? undefined : validation.errors,
+    _confidence:      typeof result.confidence === 'number' ? result.confidence : null,
+    _meetsThreshold:  typeof result.confidence === 'number' && result.confidence >= AUTO_PLACEMENT_MIN_CONFIDENCE,
+  });
 });
 
 // ── GENERATE PREVIEW ──────────────────────────────────────────────────────────
