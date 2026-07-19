@@ -168,6 +168,17 @@ try {
   admin = null; adminDb = null;
 }
 
+// ── HAIRCUT STATE LAB (private, owner-only — see /lab/* routes) ───────────────
+// Steps 1-4 only: anatomy analysis, deterministic planning, mask rasterization.
+// No FLUX or Veo call happens anywhere in this phase — see services/haircutState
+// and services/video, which are intentionally not required here.
+const { analyzeHeadPhoto }      = require('./services/anatomy');
+const { calculateLowTaperPlan } = require('./services/planning/lowTaperV1');
+const { buildActiveZoneMask }   = require('./services/mask/activeZoneMask');
+const { uploadLabFile, getSignedReadUrl } = require('./services/storage/labStorage');
+const LAB_COLLECTION = 'haircut_state_lab_tests';
+function labEnabled() { return process.env.FEATURE_HAIRCUT_STATE_LAB === 'true'; }
+
 // ── FIREBASE REST HELPERS ─────────────────────────────────────────────────────
 // Verify a Firebase ID token and return { uid, email, emailVerified }
 async function verifyFirebaseToken(idToken) {
@@ -1383,53 +1394,9 @@ async function callClaudeVision(base64, mediaType, systemPrompt, userText, opts 
 }
 
 // ── IMAGE NORMALIZATION ───────────────────────────────────────────────────────
-const MAX_IMG_DIMENSION = 1600;
-const JPEG_QUALITY      = 82;
-
-async function normalizeImage(buffer, originalMimetype, logCtx) {
-  let workBuf  = buffer;
-  let workMime = originalMimetype || 'image/jpeg';
-
-  // Convert HEIC/HEIF → JPEG (pure-JS, no native lib needed)
-  if (workMime === 'image/heic' || workMime === 'image/heif') {
-    try {
-      const heicConvert = require('heic-convert');
-      workBuf  = Buffer.from(await heicConvert({ buffer: workBuf, format: 'JPEG', quality: 0.9 }));
-      workMime = 'image/jpeg';
-      logCtx.heicConverted = true;
-    } catch(e) {
-      logCtx.heicConvertError = e.message;
-      // Fall through and let sharp try anyway
-    }
-  }
-
-  const sharp = require('sharp');
-  const img   = sharp(workBuf).rotate(); // auto-orient via EXIF
-  const meta  = await img.metadata();
-  logCtx.originalWidth  = meta.width;
-  logCtx.originalHeight = meta.height;
-  logCtx.originalFormat = meta.format;
-
-  // Reject if sharp can't read the image at all
-  if (!meta.width || !meta.height) throw new Error('IMAGE_UNREADABLE: sharp could not decode image');
-
-  // Resize if oversized (keeps aspect ratio, never enlarges)
-  const needsResize = meta.width > MAX_IMG_DIMENSION || meta.height > MAX_IMG_DIMENSION;
-  const pipeline    = needsResize
-    ? img.resize(MAX_IMG_DIMENSION, MAX_IMG_DIMENSION, { fit: 'inside', withoutEnlargement: true })
-    : img;
-  if (needsResize) logCtx.resized = true;
-
-  const outBuf = await pipeline.jpeg({ quality: JPEG_QUALITY, mozjpeg: false }).toBuffer();
-  if (!outBuf || outBuf.length < 1000) throw new Error('IMAGE_EMPTY: processed image is too small to be valid');
-
-  logCtx.processedSize   = outBuf.length;
-  logCtx.processedFormat = 'image/jpeg';
-  logCtx.processedWidth  = needsResize ? Math.round(meta.width  * Math.min(MAX_IMG_DIMENSION/meta.width, MAX_IMG_DIMENSION/meta.height)) : meta.width;
-  logCtx.processedHeight = needsResize ? Math.round(meta.height * Math.min(MAX_IMG_DIMENSION/meta.width, MAX_IMG_DIMENSION/meta.height)) : meta.height;
-
-  return { buffer: outBuf, mediaType: 'image/jpeg' };
-}
+// Extracted to services/shared/normalizeImage.js (Haircut State Lab phase 1)
+// so the new /lab/* routes can reuse it. Behavior unchanged.
+const { normalizeImage } = require('./services/shared/normalizeImage');
 
 // Simplified retry prompt — less strict JSON, shorter, more tolerant
 const FADE_FINISH_PROMPT_SIMPLE = `You are a barber reviewing a finished haircut photo. Coach the person — do not reject.
@@ -1838,6 +1805,168 @@ app.get('/founder/ai-requests', requireAuth, founderRateLimit, requireOwner, asy
     console.error('[/founder/ai-requests]', e.message);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── HAIRCUT STATE LAB ROUTES (private, owner-only) ─────────────────────────────
+// Steps 1-4: anatomy -> planner -> mask. No image/video generation call
+// exists yet — see services/haircutState and services/video.
+
+app.post('/lab/analyze-anatomy', upload.single('photo'), requireAuth, founderRateLimit, requireOwner, async (req, res) => {
+  if (!labEnabled()) return res.status(404).json({ error: 'lab_disabled' });
+  if (!req.file) return res.status(400).json({ error: 'No photo uploaded', reason: 'no_file' });
+  if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'AI not configured', reason: 'not_configured' });
+  if (!adminDb || !admin) return res.status(500).json({ error: 'Firebase Admin not configured', reason: 'storage_not_configured' });
+
+  const uid = req.user.uid;
+  const testId = `test_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  const logCtx = {};
+
+  let normalized;
+  try {
+    normalized = await normalizeImage(req.file.buffer, req.file.mimetype, logCtx);
+  } catch(normErr) {
+    console.error('[/lab/analyze-anatomy] normalization failed', normErr.message);
+    return res.status(422).json({ error: 'image_normalization_failed', reason: normErr.message });
+  }
+
+  let uploadResult;
+  try {
+    uploadResult = await uploadLabFile(admin, {
+      ownerUid: uid, testId, filename: 'original.jpg',
+      buffer: normalized.buffer, contentType: 'image/jpeg',
+    });
+  } catch(storageErr) {
+    console.error('[/lab/analyze-anatomy] storage upload failed', storageErr.message);
+    return res.status(500).json({ error: 'storage_upload_failed', reason: storageErr.message });
+  }
+
+  const base64 = normalized.buffer.toString('base64');
+  const analysis = await analyzeHeadPhoto({
+    base64, mediaType: normalized.mediaType,
+    provider: process.env.HEAD_ANALYSIS_PROVIDER || 'claude',
+  }).catch(err => ({ success: false, anatomy: null, validation: null, durationMs: 0, attempts: 0, provider: 'claude', model: null, promptVersion: null, error: err.message }));
+
+  const now = Date.now();
+  const imageDimensions = { width: logCtx.processedWidth, height: logCtx.processedHeight };
+  const doc = {
+    testId, ownerUid: uid,
+    createdAt: now, updatedAt: now,
+    imageDimensions,
+    storage: { originalPath: uploadResult.path, maskPath: null, stateImagePath: null, videoPath: null },
+    anatomy: analysis.success ? analysis.anatomy : null,
+    anatomyValidation: analysis.success ? analysis.validation : null,
+    anatomyProvider: analysis.provider,
+    anatomyModel: analysis.model,
+    anatomyPromptVersion: analysis.promptVersion,
+    anatomyDurationMs: analysis.durationMs,
+    anatomyAttempts: analysis.attempts,
+    anatomyStatus: analysis.success ? 'success' : 'failed',
+    anatomyFailureReason: analysis.success ? null : analysis.error,
+    plan: null, methodVersion: null, planStatus: null, planFailureReason: null,
+    generation: null, evaluation: null, costLog: [],
+  };
+
+  try {
+    await adminDb.collection(LAB_COLLECTION).doc(testId).set(doc);
+  } catch(fsErr) {
+    // Non-fatal — the analysis result below is still useful even if the
+    // record can't be reloaded later via GET /lab/tests/:testId.
+    console.error('[/lab/analyze-anatomy] Firestore write failed', fsErr.message);
+  }
+
+  if (!analysis.success) {
+    return res.status(500).json({
+      testId, originalUrl: uploadResult.url, imageDimensions,
+      anatomyStatus: 'failed', anatomyFailureReason: analysis.error,
+    });
+  }
+
+  res.json({
+    testId,
+    originalUrl: uploadResult.url,
+    imageDimensions,
+    anatomy: analysis.anatomy,
+    validation: analysis.validation,
+    provider: analysis.provider,
+    model: analysis.model,
+    promptVersion: analysis.promptVersion,
+    durationMs: analysis.durationMs,
+    anatomyStatus: 'success',
+  });
+});
+
+app.post('/lab/plan-haircut', requireAuth, founderRateLimit, requireOwner, async (req, res) => {
+  if (!labEnabled()) return res.status(404).json({ error: 'lab_disabled' });
+  if (!adminDb || !admin) return res.status(500).json({ error: 'Firebase Admin not configured' });
+
+  const { testId, methodVersion = 'angel_low_taper_v1' } = req.body || {};
+  if (!testId) return res.status(400).json({ error: 'testId required' });
+
+  const uid = req.user.uid;
+  const ref = adminDb.collection(LAB_COLLECTION).doc(testId);
+  const snap = await ref.get().catch(() => null);
+  if (!snap || !snap.exists) return res.status(404).json({ error: 'test_not_found' });
+  const doc = snap.data();
+  if (doc.ownerUid !== uid) return res.status(403).json({ error: 'forbidden' });
+  if (doc.anatomyStatus !== 'success' || !doc.anatomy) {
+    return res.status(400).json({ error: 'anatomy_required', reason: 'anatomy analysis must succeed before planning' });
+  }
+
+  // The planner takes the FULL anatomy-stage shape (visibleSide + nested
+  // anatomy + confidence), not just the landmarks object — see
+  // services/planning/lowTaperV1.js's doc comment.
+  const anatomyForPlanner = {
+    success: true,
+    visibleSide: doc.anatomy.visibleSide,
+    anatomy: doc.anatomy.anatomy,
+    confidence: doc.anatomy.confidence,
+  };
+  const plan = calculateLowTaperPlan({ anatomy: anatomyForPlanner, methodVersion, imageDimensions: doc.imageDimensions });
+
+  if (plan.failureReason) {
+    await ref.update({ plan, methodVersion, planStatus: 'failed', planFailureReason: plan.failureReason, updatedAt: Date.now() }).catch(()=>{});
+    return res.status(422).json({ testId, planStatus: 'failed', plan });
+  }
+
+  let maskUpload;
+  try {
+    const maskBuffer = await buildActiveZoneMask(plan.activeZonePolygon, doc.imageDimensions.width, doc.imageDimensions.height);
+    maskUpload = await uploadLabFile(admin, {
+      ownerUid: uid, testId, filename: 'active-zone-mask.png',
+      buffer: maskBuffer, contentType: 'image/png',
+    });
+  } catch(maskErr) {
+    console.error('[/lab/plan-haircut] mask generation failed', maskErr.message);
+    await ref.update({ plan, methodVersion, planStatus: 'failed', planFailureReason: `mask_error: ${maskErr.message}`, updatedAt: Date.now() }).catch(()=>{});
+    return res.status(500).json({ testId, planStatus: 'failed', reason: `mask_error: ${maskErr.message}`, plan });
+  }
+
+  await ref.update({
+    plan, methodVersion, planStatus: 'success', planFailureReason: null,
+    'storage.maskPath': maskUpload.path, updatedAt: Date.now(),
+  });
+
+  res.json({ testId, planStatus: 'success', plan, maskUrl: maskUpload.url });
+});
+
+app.get('/lab/tests/:testId', requireAuth, requireOwner, async (req, res) => {
+  if (!labEnabled()) return res.status(404).json({ error: 'lab_disabled' });
+  if (!adminDb || !admin) return res.status(500).json({ error: 'Firebase Admin not configured' });
+
+  const snap = await adminDb.collection(LAB_COLLECTION).doc(req.params.testId).get().catch(() => null);
+  if (!snap || !snap.exists) return res.status(404).json({ error: 'test_not_found' });
+  const doc = snap.data();
+  if (doc.ownerUid !== req.user.uid) return res.status(403).json({ error: 'forbidden' });
+
+  const urls = {};
+  try {
+    if (doc.storage?.originalPath) urls.originalUrl = await getSignedReadUrl(admin, doc.storage.originalPath);
+    if (doc.storage?.maskPath)     urls.maskUrl     = await getSignedReadUrl(admin, doc.storage.maskPath);
+  } catch(e) {
+    console.error('[/lab/tests/:id] signed URL refresh failed', e.message);
+  }
+
+  res.json({ ...doc, ...urls });
 });
 
 const PORT = process.env.PORT || 3000;
