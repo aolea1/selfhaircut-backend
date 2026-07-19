@@ -179,6 +179,19 @@ const { uploadLabFile, getSignedReadUrl } = require('./services/storage/labStora
 const LAB_COLLECTION = 'haircut_state_lab_tests';
 function labEnabled() { return process.env.FEATURE_HAIRCUT_STATE_LAB === 'true'; }
 
+// Runs BEFORE requireAuth on every /lab/* route so a disabled flag returns a
+// uniform 404 to everyone — including unauthenticated probes. Checking the
+// flag only inside the handler (after auth middleware) would leak "this
+// route exists and requires auth" via a 401 instead of a clean 404.
+function requireLabEnabled(req, res, next) {
+  if (!labEnabled()) return res.status(404).json({ error: 'not_found' });
+  next();
+}
+
+if (!process.env.FIREBASE_STORAGE_BUCKET) {
+  console.warn('[Haircut State Lab] FIREBASE_STORAGE_BUCKET not set — defaulting to selfhaircutai.firebasestorage.app. Set it explicitly if that is ever wrong.');
+}
+
 // ── FIREBASE REST HELPERS ─────────────────────────────────────────────────────
 // Verify a Firebase ID token and return { uid, email, emailVerified }
 async function verifyFirebaseToken(idToken) {
@@ -1810,9 +1823,20 @@ app.get('/founder/ai-requests', requireAuth, founderRateLimit, requireOwner, asy
 // ── HAIRCUT STATE LAB ROUTES (private, owner-only) ─────────────────────────────
 // Steps 1-4: anatomy -> planner -> mask. No image/video generation call
 // exists yet — see services/haircutState and services/video.
+// requireLabEnabled runs first on every route below, ahead of auth, so a
+// disabled flag is a uniform 404 for anyone — see its definition above.
 
-app.post('/lab/analyze-anatomy', upload.single('photo'), requireAuth, founderRateLimit, requireOwner, async (req, res) => {
-  if (!labEnabled()) return res.status(404).json({ error: 'lab_disabled' });
+// Wraps multer so a rejected upload (oversized file, malformed multipart
+// body) returns a clean JSON 400 instead of an unhandled exception —
+// multer's own error path doesn't reach Express's normal middleware chain.
+function uploadSinglePhoto(req, res, next) {
+  upload.single('photo')(req, res, (err) => {
+    if (err) return res.status(400).json({ error: 'upload_failed', reason: err.message });
+    next();
+  });
+}
+
+app.post('/lab/analyze-anatomy', requireLabEnabled, uploadSinglePhoto, requireAuth, founderRateLimit, requireOwner, async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No photo uploaded', reason: 'no_file' });
   if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'AI not configured', reason: 'not_configured' });
   if (!adminDb || !admin) return res.status(500).json({ error: 'Firebase Admin not configured', reason: 'storage_not_configured' });
@@ -1869,9 +1893,12 @@ app.post('/lab/analyze-anatomy', upload.single('photo'), requireAuth, founderRat
   try {
     await adminDb.collection(LAB_COLLECTION).doc(testId).set(doc);
   } catch(fsErr) {
-    // Non-fatal — the analysis result below is still useful even if the
-    // record can't be reloaded later via GET /lab/tests/:testId.
+    // Hard failure, not logged-and-continued: without a Firestore record the
+    // original.jpg we just wrote to Storage becomes orphaned — no record
+    // references it, no failure state is recoverable, and testId is
+    // meaningless for a later /lab/plan-haircut or /lab/tests/:id call.
     console.error('[/lab/analyze-anatomy] Firestore write failed', fsErr.message);
+    return res.status(500).json({ error: 'record_write_failed', reason: fsErr.message, testId });
   }
 
   if (!analysis.success) {
@@ -1895,8 +1922,7 @@ app.post('/lab/analyze-anatomy', upload.single('photo'), requireAuth, founderRat
   });
 });
 
-app.post('/lab/plan-haircut', requireAuth, founderRateLimit, requireOwner, async (req, res) => {
-  if (!labEnabled()) return res.status(404).json({ error: 'lab_disabled' });
+app.post('/lab/plan-haircut', requireLabEnabled, requireAuth, founderRateLimit, requireOwner, async (req, res) => {
   if (!adminDb || !admin) return res.status(500).json({ error: 'Firebase Admin not configured' });
 
   const { testId, methodVersion = 'angel_low_taper_v1' } = req.body || {};
@@ -1941,16 +1967,23 @@ app.post('/lab/plan-haircut', requireAuth, founderRateLimit, requireOwner, async
     return res.status(500).json({ testId, planStatus: 'failed', reason: `mask_error: ${maskErr.message}`, plan });
   }
 
-  await ref.update({
-    plan, methodVersion, planStatus: 'success', planFailureReason: null,
-    'storage.maskPath': maskUpload.path, updatedAt: Date.now(),
-  });
+  try {
+    await ref.update({
+      plan, methodVersion, planStatus: 'success', planFailureReason: null,
+      'storage.maskPath': maskUpload.path, updatedAt: Date.now(),
+    });
+  } catch(fsErr) {
+    // The mask was uploaded successfully but the record update failed — do
+    // not report success, or storage.maskPath would silently point nowhere
+    // and the mask file would be orphaned with no recorded state.
+    console.error('[/lab/plan-haircut] Firestore update failed after mask upload', fsErr.message);
+    return res.status(500).json({ error: 'record_write_failed', reason: fsErr.message, testId });
+  }
 
   res.json({ testId, planStatus: 'success', plan, maskUrl: maskUpload.url });
 });
 
-app.get('/lab/tests/:testId', requireAuth, requireOwner, async (req, res) => {
-  if (!labEnabled()) return res.status(404).json({ error: 'lab_disabled' });
+app.get('/lab/tests/:testId', requireLabEnabled, requireAuth, requireOwner, async (req, res) => {
   if (!adminDb || !admin) return res.status(500).json({ error: 'Firebase Admin not configured' });
 
   const snap = await adminDb.collection(LAB_COLLECTION).doc(req.params.testId).get().catch(() => null);
